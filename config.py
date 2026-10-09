@@ -43,6 +43,22 @@ class Config:
         if x.strip() and x.strip().isdigit()
     ]
 
+    # --- Reportes automáticos ---
+    REPORT_CHANNEL_ID = _int_env("REPORT_CHANNEL_ID")
+    REPORT_HOUR_UTC = os.getenv("REPORT_HOUR_UTC", "12:00")
+
+    # --- Recordatorios ---
+    REMINDER_DM_DELAY = float(os.getenv("REMINDER_DM_DELAY", "1.2"))
+
+    @classmethod
+    def report_hour_and_minute(cls) -> tuple[int, int]:
+        """Parsea 'HH:MM' y devuelve (hora, minuto). Fallback a 12:00."""
+        try:
+            h, m = cls.REPORT_HOUR_UTC.split(":")
+            return int(h), int(m)
+        except (ValueError, AttributeError):
+            return 12, 0
+
     @classmethod
     def api_url(cls, path: str) -> str:
         """Compone URLs: /horario → https://linhir.online/api/bot/horario"""

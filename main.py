@@ -27,12 +27,15 @@ logger = logging.getLogger(__name__)
 COGS = (
     "cogs.utilities",
     "cogs.identity",
+    "cogs.reports",
+    "cogs.reminders",
 )
 
 
 class LinhirAssistant(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents, help_command=None)
 
     async def setup_hook(self):

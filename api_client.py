@@ -170,3 +170,12 @@ class APIClient:
         """
         payload = {"discord_user_id": discord_user_id}
         return await cls._request("POST", "/sync-registration", payload)
+    
+    @classmethod
+    async def get_registered_members(cls) -> tuple[dict, int]:
+        """
+        GET /api/bot/members
+        Devuelve el roster completo del gremio con estado de vinculación Discord.
+        Estructura: {success, guild_id, totals, guild_registered, guild_unregistered, all_linked}
+        """
+        return await cls._get("/members")
