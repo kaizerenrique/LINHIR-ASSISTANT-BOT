@@ -237,7 +237,7 @@ class IdentityCog(commands.Cog):
                 await self._apply_member(target, character)
                 embed = self._embed_sync_member(target, character, is_self)
             else:
-                await self._apply_public(target, downgrade=True)
+                await self._apply_public(target, character, downgrade=True)
                 embed = self._embed_sync_public(target, character, is_self)
 
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -306,7 +306,7 @@ class IdentityCog(commands.Cog):
                 await self._apply_member(target_member, character)
                 embed = self._embed_member(character, birthdate_iso, target_member)
             else:  # public
-                await self._apply_public(target_member, downgrade=False)
+                await self._apply_public(target_member, character, downgrade=False)
                 embed = self._embed_public(character, target_member)
 
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -356,10 +356,14 @@ class IdentityCog(commands.Cog):
             member, character["name"], [r.name for r in roles_to_add],
         )
 
-    async def _apply_public(self, member: discord.Member, downgrade: bool):
+    async def _apply_public(
+        self, member: discord.Member, character: dict, downgrade: bool
+    ):
         """
-        Aplica @Publico.
-        Si `downgrade=True`: además quita @Linhir y el prefijo del nickname.
+        Aplica @Publico y establece el nickname SIN prefijo [LH].
+
+        Si `downgrade=True` (usado en /register update cuando el usuario
+        salió del gremio): además quita @Linhir si lo tenía.
         """
         roles_to_add    = []
         roles_to_remove = []
@@ -370,18 +374,18 @@ class IdentityCog(commands.Cog):
         if publico_role and publico_role not in member.roles:
             roles_to_add.append(publico_role)
 
-        if downgrade:
-            if linhir_role and linhir_role in member.roles:
-                roles_to_remove.append(linhir_role)
+        if downgrade and linhir_role and linhir_role in member.roles:
+            roles_to_remove.append(linhir_role)
 
-            # Quitar prefijo del nickname si existe
-            prefix = Config.NICKNAME_PREFIX
-            if member.nick and member.nick.startswith(prefix):
-                # Reset a None → Discord usa el username por defecto
-                try:
-                    await member.edit(nick=None, reason="Linhir: salida del gremio")
-                except discord.HTTPException as exc:
-                    logger.warning("No se pudo resetear nickname de %s: %s", member, exc)
+        # Nickname: solo el nombre del personaje, SIN prefijo [LH]
+        new_nick = character["name"][:32]
+        if member.nick != new_nick:
+            try:
+                await member.edit(nick=new_nick, reason="Linhir: registro público")
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "No se pudo actualizar nickname de %s: %s", member, exc
+                )
 
         if roles_to_add:
             await member.add_roles(*roles_to_add, reason="Linhir: registro público")
@@ -389,8 +393,11 @@ class IdentityCog(commands.Cog):
             await member.remove_roles(*roles_to_remove, reason="Linhir: salida del gremio")
 
         logger.info(
-            "Público aplicado: %s (añadidos=%s, quitados=%s, downgrade=%s)",
-            member, [r.name for r in roles_to_add], [r.name for r in roles_to_remove], downgrade,
+            "Público aplicado: %s (nick=%s, añadidos=%s, quitados=%s, downgrade=%s)",
+            member, new_nick,
+            [r.name for r in roles_to_add],
+            [r.name for r in roles_to_remove],
+            downgrade,
         )
 
     # ================================================================= #
@@ -438,6 +445,11 @@ class IdentityCog(commands.Cog):
                 f"gremio Linhir ({target.mention})."
             ),
             color=Config.EMBED_ACCENT,
+        )
+        embed.add_field(
+            name="🏷️ Apodo actualizado",
+            value=f"`{character['name']}` (sin prefijo)",
+            inline=False,
         )
         embed.add_field(
             name="🛡️ Gremio actual",
@@ -504,7 +516,16 @@ class IdentityCog(commands.Cog):
             value=character.get("guild_name") or "Sin gremio",
             inline=True,
         )
-        embed.add_field(name="🎭 Roles", value="@Publico (se quitó @Linhir)", inline=False)
+        embed.add_field(
+            name="🏷️ Apodo actualizado",
+            value=f"`{character['name']}` (sin prefijo)",
+            inline=False,
+        )
+        embed.add_field(
+            name="🎭 Roles",
+            value="@Publico (se quitó @Linhir)",
+            inline=False,
+        )
         embed.set_footer(
             text=f"{Config.GUILD_NAME} Assistant",
             icon_url=self.bot.user.display_avatar.url,
