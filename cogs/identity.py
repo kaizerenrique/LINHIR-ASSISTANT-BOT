@@ -88,6 +88,112 @@ class IdentityCog(commands.Cog):
         )
 
     # ------------------------------------------------------------------ #
+    #                      /register search                               #
+    # ------------------------------------------------------------------ #
+
+    @register_group.command(
+        name="search",
+        description="Busca tu personaje por nombre y elige si hay varios con el mismo nombre",
+    )
+    @app_commands.describe(
+        personaje="Nombre de tu personaje (búsqueda tolerante a duplicados)",
+        cumpleanos="Tu cumpleaños en formato DD/MM/YYYY (ej. 25/09/1995)",
+    )
+    async def register_search(
+        self,
+        interaction: discord.Interaction,
+        personaje: str,
+        cumpleanos: str,
+    ):
+        """
+        Búsqueda con desambiguación.
+
+        Flujo:
+          1. Valida el cumpleaños localmente.
+          2. Consulta /api/bot/search-character.
+          3. Si hay 1 solo resultado → registra directamente.
+          4. Si hay varios → muestra un menú desplegable para elegir.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if not interaction.guild:
+            await interaction.followup.send(
+                "❌ Este comando solo funciona en el servidor de Linhir.",
+                ephemeral=True,
+            )
+            return
+
+        # Validar cumpleaños
+        birthdate_iso, error = parse_birthdate(cumpleanos)
+        if error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+
+        # Resolver Member fresco (por consistencia con el flujo de registro)
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+        except discord.HTTPException as exc:
+            logger.error("Error obteniendo miembro: %s", exc)
+            await interaction.followup.send(
+                "⚠️ Hubo un problema al obtener tu perfil. Intenta de nuevo.",
+                ephemeral=True,
+            )
+            return
+
+        # Consultar al backend
+        try:
+            result, status = await APIClient.search_character(personaje.strip())
+        except AuthenticationError as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+        except AuthorizationError as exc:
+            await interaction.followup.send(f"⛔ {exc}", ephemeral=True)
+            return
+
+        if status != 200:
+            await interaction.followup.send(
+                "❌ El servidor de Linhir no está disponible. Intenta más tarde.",
+                ephemeral=True,
+            )
+            return
+
+        if not result.get("success"):
+            await interaction.followup.send(
+                f"❌ {result.get('reason', 'No se pudo buscar el personaje.')}",
+                ephemeral=True,
+            )
+            return
+
+        players = result.get("players", [])
+
+        if not players:
+            await interaction.followup.send(
+                f"❌ No se encontró ningún personaje con el nombre **{personaje}**.",
+                ephemeral=True,
+            )
+            return
+
+        if len(players) == 1:
+            # Único resultado → registrar directamente
+            await self._register_with_id(
+                interaction=interaction,
+                target_member=member,
+                character_id=players[0]["id"],
+                birthdate_iso=birthdate_iso,
+                performed_by=None,
+            )
+            return
+
+        # Múltiples resultados → mostrar menú de selección
+        await self._show_selection_menu(
+            interaction=interaction,
+            target_member=member,
+            players=players,
+            birthdate_iso=birthdate_iso,
+            performed_by=None,
+        )
+
+    # ------------------------------------------------------------------ #
     #                      /register manager                              #
     # ------------------------------------------------------------------ #
 
@@ -268,7 +374,12 @@ class IdentityCog(commands.Cog):
         birthdate_iso: str,
         performed_by: str | None,
     ):
-        """Lógica común para start y manager."""
+        """
+        Lógica común para start y manager.
+
+        Si el backend indica que el nombre es ambiguo (múltiples personajes
+        con el mismo nombre), se sugiere al usuario usar `/register search`.
+        """
         try:
             result, status = await APIClient.register_character(
                 character_name=personaje,
@@ -287,6 +398,16 @@ class IdentityCog(commands.Cog):
         if status != 200:
             await interaction.followup.send(
                 "❌ El servidor de Linhir no está disponible. Intenta más tarde.",
+                ephemeral=True,
+            )
+            return
+
+        # Caso especial: nombre ambiguo → guiar al usuario a /register search
+        if not result.get("success") and result.get("ambiguous"):
+            await interaction.followup.send(
+                f"⚠️ {result.get('reason', 'Múltiples personajes con ese nombre.')}\n\n"
+                f"Ejecuta:\n"
+                f"```\n/register search personaje:{personaje} cumpleanos:{birthdate_iso}\n```",
                 ephemeral=True,
             )
             return
@@ -324,6 +445,188 @@ class IdentityCog(commands.Cog):
                 "❌ Hubo un problema al aplicar los cambios. Contacta a un administrador.",
                 ephemeral=True,
             )
+
+    async def _register_with_id(
+        self,
+        interaction: discord.Interaction,
+        target_member: discord.Member,
+        character_id: str,
+        birthdate_iso: str,
+        performed_by: str | None,
+        followup_override: discord.Interaction | None = None,
+    ):
+        """
+        Registra un personaje usando su `character_id` único.
+
+        Usado por `/register search` cuando:
+          - Solo hay un resultado (registro directo).
+          - El usuario elige del menú desplegable.
+
+        `followup_override`: si viene, se usa ese interaction para responder
+        (necesario cuando la llamada viene desde el callback de un Select).
+        """
+        responder = followup_override or interaction
+
+        try:
+            result, status = await APIClient.register_character(
+                character_id=character_id,
+                discord_user_id=str(target_member.id),
+                birthdate=birthdate_iso,
+                discord_username=str(target_member),
+                performed_by_discord_id=performed_by,
+            )
+        except AuthenticationError as exc:
+            await responder.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+        except AuthorizationError as exc:
+            await responder.followup.send(f"⛔ {exc}", ephemeral=True)
+            return
+
+        if status != 200:
+            await responder.followup.send(
+                "❌ El servidor de Linhir no está disponible. Intenta más tarde.",
+                ephemeral=True,
+            )
+            return
+
+        if not result.get("success"):
+            await responder.followup.send(
+                f"❌ {result.get('reason', 'No se pudo registrar el personaje.')}",
+                ephemeral=True,
+            )
+            return
+
+        decision  = result["decision"]
+        character = result.get("character", {})
+
+        try:
+            if decision == "member":
+                await self._apply_member(target_member, character)
+                embed = self._embed_member(character, birthdate_iso, target_member)
+            else:
+                await self._apply_public(target_member, character, downgrade=False)
+                embed = self._embed_public(character, target_member)
+
+            await responder.followup.send(embed=embed, ephemeral=True)
+
+        except discord.Forbidden:
+            logger.error("Bot sin permisos para editar %s", target_member)
+            await responder.followup.send(
+                "⚠️ El bot no tiene permisos para cambiar el apodo o roles de "
+                f"**{target_member.display_name}**. Verifica la jerarquía de roles.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            logger.exception("Error HTTP al aplicar registro: %s", exc)
+            await responder.followup.send(
+                "❌ Hubo un problema al aplicar los cambios. Contacta a un administrador.",
+                ephemeral=True,
+            )
+
+    async def _show_selection_menu(
+        self,
+        interaction: discord.Interaction,
+        target_member: discord.Member,
+        players: list[dict],
+        birthdate_iso: str,
+        performed_by: str | None,
+    ):
+        """
+        Muestra un menú desplegable para que el usuario elija su personaje
+        entre varios que comparten el mismo nombre.
+
+        Discord permite máximo 25 opciones por Select. Si hay más, se
+        truncan a 25 (caso extremadamente raro en Albion).
+        """
+        # Construir opciones del menú (máx 25)
+        options: list[discord.SelectOption] = []
+        for p in players[:25]:
+            guild_name = p.get("guild_name") or "Sin gremio"
+            kill_fame = p.get("kill_fame", 0) or 0
+            is_linhir = guild_name.lower() == Config.GUILD_NAME.lower()
+
+            # Discord limita label a 100 chars y description a 100 chars
+            label = p["name"][:95] + " ✓" if is_linhir else p["name"][:100]
+            description = f"Gremio: {guild_name} · Fama PvP: {kill_fame:,}"[:100]
+
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=description,
+                    value=p["id"],
+                    emoji="🛡️" if is_linhir else "⚔️",
+                    default=False,
+                )
+            )
+
+        # Select para la elección
+        select = discord.ui.Select(
+            placeholder="Selecciona tu personaje correcto...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+        # Autor de la interacción (para verificar ownership)
+        original_author_id = interaction.user.id
+
+        async def select_callback(select_interaction: discord.Interaction):
+            # Solo el autor original puede seleccionar
+            if select_interaction.user.id != original_author_id:
+                await select_interaction.response.send_message(
+                    "❌ Solo quien inició el registro puede seleccionar.",
+                    ephemeral=True,
+                )
+                return
+
+            selected_id = select.values[0]
+
+            # Desactivar el Select tras la selección
+            for opt in select.options:
+                opt.default = opt.value == selected_id
+            select.disabled = True
+
+            # Responder con defer para dar tiempo al registro
+            await select_interaction.response.defer(ephemeral=True, thinking=True)
+
+            # Editar el mensaje original para reflejar la elección
+            try:
+                await select_interaction.edit_original_response(
+                    content=f"⏳ Registrando personaje seleccionado...",
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+            # Registrar con el ID elegido
+            await self._register_with_id(
+                interaction=interaction,
+                target_member=target_member,
+                character_id=selected_id,
+                birthdate_iso=birthdate_iso,
+                performed_by=performed_by,
+                followup_override=select_interaction,
+            )
+
+        select.callback = select_callback
+
+        view = discord.ui.View(timeout=120)
+        view.add_item(select)
+
+        # Embed explicativo
+        embed = discord.Embed(
+            title="🔍 Múltiples personajes encontrados",
+            description=(
+                f"Se encontraron **{len(players)} personajes** con el nombre "
+                f"**{players[0]['name']}**.\n\n"
+                "Por favor, selecciona **tu personaje** en el menú de abajo.\n"
+                "El que tiene el ícono 🛡️ pertenece a Linhir."
+            ),
+            color=Config.EMBED_ACCENT,
+        )
+        embed.set_footer(text="Selecciona con cuidado: la elección no se puede deshacer.")
+
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     # ================================================================= #
     #                    Helpers de aplicación de roles                  #

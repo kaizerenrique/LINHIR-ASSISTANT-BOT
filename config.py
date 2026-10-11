@@ -50,6 +50,9 @@ class Config:
     # --- Recordatorios ---
     REMINDER_DM_DELAY = float(os.getenv("REMINDER_DM_DELAY", "1.2"))
 
+    # --- Canal de identificación (panel de registro) ---
+    IDENTIFY_CHANNEL_ID = _int_env("IDENTIFY_CHANNEL_ID")
+
     @classmethod
     def report_hour_and_minute(cls) -> tuple[int, int]:
         """Parsea 'HH:MM' y devuelve (hora, minuto). Fallback a 12:00."""

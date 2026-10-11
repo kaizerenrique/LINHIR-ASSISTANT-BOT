@@ -179,3 +179,31 @@ class APIClient:
         Estructura: {success, guild_id, totals, guild_registered, guild_unregistered, all_linked}
         """
         return await cls._get("/members")
+
+    @classmethod
+    async def search_character(cls, name: str) -> tuple[dict, int]:
+        """POST /api/bot/search-character"""
+        return await cls._request("POST", "/search-character", {"character_name": name})
+
+    @classmethod
+    async def register_character(
+        cls,
+        character_name: str | None = None,
+        character_id: str | None = None,
+        discord_user_id: str = "",
+        birthdate: str | None = None,
+        discord_username: str | None = None,
+        performed_by_discord_id: str | None = None,
+    ) -> tuple[dict, int]:
+        payload = {"discord_user_id": discord_user_id}
+        if character_id:
+            payload["character_id"] = character_id
+        elif character_name:
+            payload["character_name"] = character_name
+        if birthdate:
+            payload["birthdate"] = birthdate
+        if discord_username:
+            payload["discord_username"] = discord_username
+        if performed_by_discord_id:
+            payload["performed_by_discord_id"] = performed_by_discord_id
+        return await cls._request("POST", "/register-character", payload)

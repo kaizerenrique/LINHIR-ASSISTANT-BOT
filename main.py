@@ -29,6 +29,7 @@ COGS = (
     "cogs.identity",
     "cogs.reports",
     "cogs.reminders",
+    "cogs.registration_panel",
 )
 
 
