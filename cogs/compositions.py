@@ -14,23 +14,218 @@ logger = logging.getLogger(__name__)
 
 
 # ===================================================================== #
-#              Modal: añadir un arma a la composición                   #
+#                     Modal: escribir emoji manual                      #
 # ===================================================================== #
 
-class AddWeaponModal(discord.ui.Modal, title="Añadir arma"):
+class CustomEmojiModal(discord.ui.Modal, title="Escribir emoji"):
+    """Modal auxiliar para usuarios que quieren pegar un emoji Unicode."""
+
+    emoji_text: discord.ui.TextInput = discord.ui.TextInput(
+        label="Emoji Unicode",
+        placeholder="Ej: 🛡️ (usa Win + . o Ctrl+Cmd+Espacio)",
+        min_length=1,
+        max_length=32,
+        required=True,
+    )
+
+    def __init__(self, picker_view: "EmojiPickerView"):
+        super().__init__()
+        self.picker_view = picker_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.emoji_text).strip()
+        icon = sanitize_emoji(raw)
+
+        if not icon:
+            await interaction.response.send_message(
+                "❌ No es un emoji válido. Intenta con otro.\n"
+                "*Nota: los emojis custom del servidor deben elegirse del "
+                "selector, no escribirse como `:nombre:`*",
+                ephemeral=True,
+            )
+            return
+
+        # Añadir al panel
+        self.picker_view.parent_view.weapons.append({
+            "name": self.picker_view.weapon_name,
+            "icon": icon,
+        })
+
+        try:
+            if self.picker_view.parent_view.message:
+                await self.picker_view.parent_view.message.edit(
+                    embed=self.picker_view.parent_view.build_embed(),
+                    view=self.picker_view.parent_view,
+                )
+        except discord.HTTPException as exc:
+            logger.warning("No se pudo refrescar panel: %s", exc)
+
+        await interaction.response.send_message(
+            f"✅ Añadido: **{self.picker_view.weapon_name}** {icon}",
+            ephemeral=True,
+        )
+        self.picker_view.stop()
+
+
+# ===================================================================== #
+#                 Vista efímera: picker de emoji                        #
+# ===================================================================== #
+
+class EmojiPickerView(discord.ui.View):
+    """
+    Vista efímera que muestra los emojis del servidor en un Select.
+
+    Opciones de UX:
+      - Select con emojis custom del servidor (hasta 25).
+      - Botón "Sin emoji" → añade el arma sin icono.
+      - Botón "Escribir otro" → abre un modal para pegar un Unicode.
+      - Botón "Cancelar" → descarta la operación.
+    """
+
+    def __init__(
+        self,
+        parent_view: "CompositionBuilderView",
+        weapon_name: str,
+        author_id: int,
+        guild: discord.Guild,
+        timeout: int = 180,
+    ):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.weapon_name = weapon_name
+        self.author_id = author_id
+
+        # Emojis del servidor (custom). Sin filtro de animated: Discord los acepta.
+        server_emojis = list(guild.emojis)[:25]
+
+        if server_emojis:
+            options = [
+                discord.SelectOption(
+                    label=e.name[:90],
+                    value=str(e),          # "<:name:id>" o "<a:name:id>"
+                    emoji=e,               # discord.py lo renderiza
+                )
+                for e in server_emojis
+            ]
+            select = discord.ui.Select(
+                placeholder=f"Elige un emoji para «{weapon_name}»...",
+                min_values=1,
+                max_values=1,
+                options=options,
+                row=0,
+            )
+            select.callback = self._on_emoji_selected
+            self.add_item(select)
+        else:
+            # Sin emojis en el servidor: informar
+            no_emoji_info = discord.ui.Button(
+                label="Sin emojis disponibles en el servidor",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=0,
+            )
+            self.add_item(no_emoji_info)
+
+        # Fila 1: botones auxiliares
+        no_emoji_btn = discord.ui.Button(
+            label="Sin emoji",
+            style=discord.ButtonStyle.secondary,
+            emoji="🚫",
+            row=1,
+        )
+        no_emoji_btn.callback = self._on_no_emoji
+        self.add_item(no_emoji_btn)
+
+        custom_btn = discord.ui.Button(
+            label="Escribir otro",
+            style=discord.ButtonStyle.primary,
+            emoji="⌨️",
+            row=1,
+        )
+        custom_btn.callback = self._on_custom
+        self.add_item(custom_btn)
+
+        cancel_btn = discord.ui.Button(
+            label="Cancelar",
+            style=discord.ButtonStyle.danger,
+            emoji="❌",
+            row=1,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Solo quien añadió el arma puede elegir el emoji.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------ #
+    #                          Callbacks                                   #
+    # ------------------------------------------------------------------ #
+
+    async def _on_emoji_selected(self, interaction: discord.Interaction):
+        select = self.children[0]
+        await self._finish(interaction, select.values[0])
+
+    async def _on_no_emoji(self, interaction: discord.Interaction):
+        await self._finish(interaction, None)
+
+    async def _on_custom(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CustomEmojiModal(self))
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="❌ Añadir arma cancelado.", view=None
+        )
+        self.stop()
+
+    async def _finish(self, interaction: discord.Interaction, icon: str | None):
+        """Añade el arma al panel público y cierra el mensaje efímero."""
+        self.parent_view.weapons.append({
+            "name": self.weapon_name,
+            "icon": icon,
+        })
+
+        try:
+            if self.parent_view.message:
+                await self.parent_view.message.edit(
+                    embed=self.parent_view.build_embed(),
+                    view=self.parent_view,
+                )
+        except discord.HTTPException as exc:
+            logger.warning("No se pudo refrescar panel de composición: %s", exc)
+
+        icon_display = icon if icon else "*(sin emoji)*"
+        await interaction.response.edit_message(
+            content=f"✅ Añadido: **{self.weapon_name}** {icon_display}",
+            view=None,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        # Al expirar, deshabilitar todo y avisar
+        for c in self.children:
+            c.disabled = True
+        logger.debug("EmojiPickerView expirada sin selección para «%s»", self.weapon_name)
+
+
+# ===================================================================== #
+#                 Modal: pedir nombre del arma                          #
+# ===================================================================== #
+
+class AddWeaponNameModal(discord.ui.Modal, title="Añadir arma"):
+    """Modal que solo pide el nombre. El emoji se elige después."""
+
     nombre: discord.ui.TextInput = discord.ui.TextInput(
         label="Nombre del arma",
         placeholder="Ej: Hallowfall",
         min_length=2,
         max_length=120,
         required=True,
-    )
-    icono: discord.ui.TextInput = discord.ui.TextInput(
-        label="Emoji (opcional, uno solo)",
-        placeholder="Ej: 🛡️",
-        min_length=0,
-        max_length=32,          # ← era 8, ahora 32 (ZWJ sequences pueden ser largos)
-        required=False,
     )
 
     def __init__(self, parent_view: "CompositionBuilderView"):
@@ -39,88 +234,27 @@ class AddWeaponModal(discord.ui.Modal, title="Añadir arma"):
 
     async def on_submit(self, interaction: discord.Interaction):
         name = str(self.nombre).strip()
-        icon_raw = str(self.icono or "").strip()
 
-        # Sanitizar emoji (devuelve None si no es válido)
-        icon = sanitize_emoji(icon_raw) if icon_raw else None
-
-        # Si el usuario escribió algo pero no es un emoji válido → avisar
-        if icon_raw and not icon:
-            await interaction.response.send_message(
-                "⚠️ El emoji no es válido. Usa **un solo emoji Unicode** "
-                "(no texto, no `:nombre:`, no varios emojis juntos).\n"
-                "Ejemplos válidos: `🛡️` · `⚔️` · `✨` · `🏹`\n"
-                "El arma se guardará **sin emoji** si continúas sin corregirlo.",
-                ephemeral=True,
-            )
-            # No abortamos: dejamos que continúe sin emoji
-            # Si prefieres abortar, cambia a `return` aquí.
-
-        # Evitar duplicados (case-insensitive)
+        # Evitar duplicados
         if any(w["name"].lower() == name.lower() for w in self.parent_view.weapons):
             await interaction.response.send_message(
                 f"⚠️ Ya añadiste **{name}**.", ephemeral=True
             )
             return
 
-        self.parent_view.weapons.append({"name": name, "icon": icon})
-
-        try:
-            if self.parent_view.message:
-                await self.parent_view.message.edit(
-                    embed=self.parent_view.build_embed(),
-                    view=self.parent_view,
-                )
-            await interaction.response.send_message(
-                f"✅ Añadido: **{name}**"
-                + (f" {icon}" if icon else " *(sin emoji)*"),
-                ephemeral=True,
-            )
-        except discord.HTTPException as exc:
-            logger.warning("No se pudo refrescar panel de composición: %s", exc)
-    nombre: discord.ui.TextInput = discord.ui.TextInput(
-        label="Nombre del arma",
-        placeholder="Ej: Hallowfall",
-        min_length=2,
-        max_length=120,
-        required=True,
-    )
-    icono: discord.ui.TextInput = discord.ui.TextInput(
-        label="Emoji (opcional)",
-        placeholder="Ej: 🛡️",
-        min_length=0,
-        max_length=8,
-        required=False,
-    )
-
-    def __init__(self, parent_view: "CompositionBuilderView"):
-        super().__init__()
-        self.parent_view = parent_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        name = str(self.nombre).strip()
-        icon = str(self.icono or "").strip()
-
-        # Evitar duplicados (case-insensitive)
-        if any(w["name"].lower() == name.lower() for w in self.parent_view.weapons):
-            await interaction.response.send_message(
-                f"⚠️ Ya añadiste **{name}**.", ephemeral=True
-            )
-            return
-
-        self.parent_view.weapons.append({"name": name, "icon": icon or None})
-
-        try:
-            if self.parent_view.message:
-                await self.parent_view.message.edit(
-                    embed=self.parent_view.build_embed(),
-                    view=self.parent_view,
-                )
-            await interaction.response.send_message(
-                f"✅ Añadido: **{name}**", ephemeral=True
-            )
-        except discord.HTTPException as exc:
-            logger.warning("No se pudo refrescar panel de composición: %s", exc)
+        # Abrir picker de emojis del servidor
+        picker = EmojiPickerView(
+            parent_view=self.parent_view,
+            weapon_name=name,
+            author_id=interaction.user.id,
+            guild=interaction.guild,
+        )
+        await interaction.response.send_message(
+            f"Arma: **{name}**\n\n"
+            f"Elige un emoji del servidor en el menú, o usa los botones de abajo.",
+            view=picker,
+            ephemeral=True,
+        )
 
 
 # ===================================================================== #
@@ -204,7 +338,7 @@ class CompositionBuilderView(discord.ui.View):
         if self.weapons:
             lines = []
             for i, w in enumerate(self.weapons, 1):
-                icon = w.get("icon") or "•"
+                icon = sanitize_emoji(w.get("icon")) or "•"
                 lines.append(f"`{i:>2}.` {icon} **{w['name']}**")
             embed.add_field(
                 name=f"⚔️ Armas ({len(self.weapons)})",
@@ -237,7 +371,7 @@ class CompositionBuilderView(discord.ui.View):
         if self.confirmed:
             await interaction.response.send_message("⚠️ Ya confirmada.", ephemeral=True)
             return
-        await interaction.response.send_modal(AddWeaponModal(self))
+        await interaction.response.send_modal(AddWeaponNameModal(self))
 
     @discord.ui.button(label="Deshacer última", style=discord.ButtonStyle.secondary, emoji="↩️", row=0)
     async def undo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -309,7 +443,7 @@ class CompositionBuilderView(discord.ui.View):
             ),
             color=0x5CCB45,
         )
-        embed.set_footer(text=f"Ya disponible en /cta crear")
+        embed.set_footer(text="Ya disponible en /cta crear")
         try:
             await interaction.edit_original_response(embed=embed, view=self)
         except discord.HTTPException:
@@ -399,10 +533,11 @@ class CompositionsCog(commands.Cog):
         )
         for c in comps[:20]:
             weapons = c.get("weapons") or []
-            preview = ", ".join(
-                f"{w.get('weapon_icon') or '•'} {w['weapon_name']}"
-                for w in weapons[:6]
-            )
+            preview_parts = []
+            for w in weapons[:6]:
+                icon = sanitize_emoji(w.get("weapon_icon")) or "•"
+                preview_parts.append(f"{icon} {w['weapon_name']}")
+            preview = ", ".join(preview_parts)
             if len(weapons) > 6:
                 preview += f" (+{len(weapons) - 6})"
 
@@ -461,10 +596,10 @@ class CompositionsCog(commands.Cog):
 
         weapons = comp.get("weapons") or []
         if weapons:
-            lines = [
-                f"`{i:>2}.` {w.get('weapon_icon') or '•'} **{w['weapon_name']}**"
-                for i, w in enumerate(weapons, 1)
-            ]
+            lines = []
+            for i, w in enumerate(weapons, 1):
+                icon = sanitize_emoji(w.get("weapon_icon")) or "•"
+                lines.append(f"`{i:>2}.` {icon} **{w['weapon_name']}**")
             embed.add_field(
                 name=f"⚔️ Armas ({len(weapons)})",
                 value="\n".join(lines)[:1024],

@@ -9,7 +9,7 @@ from discord.ext import commands, tasks
 
 from api_client import APIClient, AuthenticationError, AuthorizationError
 from config import Config
-from utils.helpers import format_number, is_officer, parse_datetime
+from utils.helpers import format_number, is_officer, parse_datetime, sanitize_emoji
 
 logger = logging.getLogger(__name__)
 
@@ -44,54 +44,60 @@ async def composition_autocomplete(
 # ===================================================================== #
 
 class WeaponSelect(discord.ui.Select):
-    """Select para elegir un arma de la composición de la CTA."""
+    """
+    Select para elegir un arma. Acepta un subconjunto (chunk) de armas.
+
+    Discord permite máximo 25 opciones por Select. Si la composición
+    tiene más armas, se crean varios Selects en filas distintas.
+    """
 
     def __init__(
         self,
         cta_id: int,
-        weapons: list[dict],
+        weapons_chunk: list[dict],
         occupancy: dict,
         author_id: int,
+        row: int,
+        chunk_label: str = "",
     ):
         self.cta_id = cta_id
         self.occupancy = occupancy
         self.author_id = author_id
 
         options: list[discord.SelectOption] = []
-        for w in weapons[:25]:
+        for w in weapons_chunk:
             wid = w["id"]
             taken_by = occupancy.get(str(wid)) or occupancy.get(wid)
-            icon = w.get("weapon_icon") or ""
+
+            # Sanear emoji: si es inválido, no pasarlo a Discord
+            icon_raw = w.get("weapon_icon")
+            icon = sanitize_emoji(icon_raw) if icon_raw else None
+
             label = w["weapon_name"][:90]
-            if taken_by:
-                # Mostrar como no disponible
-                options.append(
-                    discord.SelectOption(
-                        label=label,
-                        description=f"Ocupada por {taken_by}"[:100],
-                        value=str(wid),
-                        emoji=icon or None,
-                    )
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=(
+                        f"Ocupada por {taken_by}" if taken_by else "Libre"
+                    )[:100],
+                    value=str(wid),
+                    emoji=icon,          # None si es inválido → Discord lo acepta
                 )
-            else:
-                options.append(
-                    discord.SelectOption(
-                        label=label,
-                        description="Libre",
-                        value=str(wid),
-                        emoji=icon or None,
-                    )
-                )
+            )
+
+        placeholder = "Elige tu arma..."
+        if chunk_label:
+            placeholder = f"Elige tu arma ({chunk_label})..."
 
         super().__init__(
-            placeholder="Elige tu arma...",
+            placeholder=placeholder[:150],
             min_values=1,
             max_values=1,
             options=options,
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Solo el autor del mensaje efímero puede elegir
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
                 "❌ Solo quien pidió unirse puede seleccionar.", ephemeral=True
@@ -100,7 +106,7 @@ class WeaponSelect(discord.ui.Select):
 
         weapon_id = int(self.values[0])
 
-        # Verificar localmente si ya está ocupada (feedback rápido)
+        # Verificación "amistosa" local (el backend valida de nuevo con lock)
         taken_by = self.occupancy.get(str(weapon_id)) or self.occupancy.get(weapon_id)
         if taken_by:
             await interaction.response.send_message(
@@ -129,11 +135,13 @@ class WeaponSelect(discord.ui.Select):
             )
             return
 
-        # Actualizar el mensaje efímero
-        weapon_name = next(
-            (w["weapon_name"] for w in self.view.weapons if w["id"] == weapon_id),
-            "—",
-        )
+        # Nombre del arma elegida (buscamos en todas las armas de la vista)
+        weapon_name = "—"
+        for w in self.view.all_weapons:
+            if w["id"] == weapon_id:
+                weapon_name = w["weapon_name"]
+                break
+
         embed = discord.Embed(
             title="✅ Inscripción confirmada",
             description=(
@@ -144,12 +152,33 @@ class WeaponSelect(discord.ui.Select):
         )
         await interaction.edit_original_response(embed=embed, view=None)
 
-        # Refrescar el mensaje público de la CTA
+        # Refrescar el embed público
         await self.view.refresh_public_message()
 
 
+# ===================================================================== #
+#              Vista con Select(s) de armas + botón Cancelar            #
+# ===================================================================== #
+
+# ===================================================================== #
+#              Vista con Select(s) de armas + botón Cancelar            #
+# ===================================================================== #
+
 class WeaponSelectView(discord.ui.View):
-    """Vista con el Select de armas + botón 'Cancelar'."""
+    """
+    Vista efímera con uno o varios Selects de armas.
+
+    Si la composición tiene >25 armas, se crean múltiples Selects en
+    filas separadas (hasta 4 filas = 100 armas). El botón Cancelar
+    ocupa la última fila disponible.
+
+    NOTA: el botón Cancelar NO usa el decorador @discord.ui.button porque
+    se auto-registraría en la fila 0 durante super().__init__() y
+    chocaría con los Selects. Se crea y añade manualmente.
+    """
+
+    MAX_WEAPONS_PER_SELECT = 25
+    MAX_ROWS_FOR_SELECTS = 4    # 4 filas × 25 = 100 armas máx
 
     def __init__(
         self,
@@ -163,39 +192,70 @@ class WeaponSelectView(discord.ui.View):
     ):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
-        self.weapons = weapons
+        self.all_weapons = weapons       # guardamos TODAS para buscar por id
         self.channel_id = channel_id
         self.message_id = message_id
-        self.add_item(WeaponSelect(cta_id, weapons, occupancy, author_id))
 
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=1)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Trocear armas en chunks de 25
+        chunks = [
+            weapons[i:i + self.MAX_WEAPONS_PER_SELECT]
+            for i in range(0, len(weapons), self.MAX_WEAPONS_PER_SELECT)
+        ]
+
+        # Limitar a las primeras 4 filas (dejamos la 5ª para el botón Cancelar)
+        if len(chunks) > self.MAX_ROWS_FOR_SELECTS:
+            logger.warning(
+                "Composición con %d armas: mostrando solo %d (límite de filas en Discord)",
+                len(weapons),
+                self.MAX_ROWS_FOR_SELECTS * self.MAX_WEAPONS_PER_SELECT,
+            )
+            chunks = chunks[:self.MAX_ROWS_FOR_SELECTS]
+
+        for i, chunk in enumerate(chunks):
+            chunk_label = ""
+            if len(chunks) > 1:
+                start = i * self.MAX_WEAPONS_PER_SELECT + 1
+                end = start + len(chunk) - 1
+                chunk_label = f"{start}-{end}"
+            self.add_item(
+                WeaponSelect(
+                    cta_id=cta_id,
+                    weapons_chunk=chunk,
+                    occupancy=occupancy,
+                    author_id=author_id,
+                    row=i,
+                    chunk_label=chunk_label,
+                )
+            )
+
+        # --- Botón Cancelar creado manualmente para controlar su fila ---
+        cancel_row = min(len(chunks), 4)
+        cancel_btn = discord.ui.Button(
+            label="Cancelar",
+            style=discord.ButtonStyle.secondary,
+            row=cancel_row,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
             content="❌ Inscripción cancelada.", embed=None, view=None
         )
 
     async def refresh_public_message(self):
-        """
-        Vuelve a leer la CTA del backend y edita el mensaje público original
-        para reflejar la nueva ocupación de armas.
-        """
+        """Recarga la CTA y edita el mensaje público original."""
         try:
             result, status = await APIClient.get_cta(self.cta_id)
             if status != 200 or not result.get("success"):
                 return
 
             channel = self.bot.get_channel(self.channel_id) if hasattr(self, "bot") else None
-            # Si no tenemos bot, obtenemos el canal por el cliente desde la interacción
-            # (lo seteamos al construir la vista: `view.bot = interaction.client`)
-            if channel is None and hasattr(self, "bot"):
-                return
-
-            if channel is None:
+            if channel is None or not self.message_id:
                 return
 
             msg = await channel.fetch_message(self.message_id)
-            cta = result["cta"]
-            embed = build_cta_embed(cta)
+            embed = build_cta_embed(result["cta"])
             await msg.edit(embed=embed)
         except Exception as exc:
             logger.warning("No se pudo refrescar el mensaje público de la CTA: %s", exc)
@@ -217,8 +277,7 @@ class CtaAnnouncementView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
 
-        # Los custom_id son fijos porque la vista se registra por message_id,
-        # no por custom_id. Cada mensaje tiene su propia instancia de la vista.
+        # custom_id estables por CTA (aunque también registramos por message_id)
         self.join_btn.custom_id = f"cta:join:{cta_id}"
         self.absent_btn.custom_id = f"cta:absent:{cta_id}"
         self.refresh_btn.custom_id = f"cta:refresh:{cta_id}"
@@ -246,6 +305,7 @@ class CtaAnnouncementView(discord.ui.View):
         cta = result["cta"]
         composition = cta.get("composition") or {}
         weapons = composition.get("weapons") or []
+
         occupancy = {}
         for p in cta.get("participants") or []:
             if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
@@ -390,7 +450,8 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         lines = []
         for w in weapons[:20]:
             taken = occupancy.get(w["id"])
-            icon = w.get("weapon_icon") or "•"
+            # Sanear emoji (dato legacy podría ser inválido)
+            icon = sanitize_emoji(w.get("weapon_icon")) or "•"
             name = w["weapon_name"]
             if taken:
                 lines.append(f"{icon} **{name}** — {taken}")
@@ -497,7 +558,6 @@ class CtasCog(commands.Cog):
     @reminder_loop.before_loop
     async def before_reminder_loop(self):
         await self.bot.wait_until_ready()
-        # Ajustar el intervalo según la config
         self.reminder_loop.change_interval(
             seconds=Config.CTA_REMINDER_POLL_SECONDS
         )
@@ -566,10 +626,6 @@ class CtasCog(commands.Cog):
                 except discord.HTTPException as exc:
                     failed += 1
                     logger.warning("DM fallo para %s: %s", uid, exc)
-
-                await discord.utils.sleep_until(
-                    datetime.now(timezone.utc).replace(microsecond=0)
-                ) if False else None  # placeholder
 
             # Marcar como enviado aunque algunos DMs fallaran
             await APIClient.mark_reminder_sent(cta_id)
@@ -686,21 +742,26 @@ class CtasCog(commands.Cog):
             logger.exception("Error creando evento: %s", exc)
 
         # =============================================================
-        # 2. Enviar mensaje embed con botones
+        # 2. Enviar mensaje placeholder SIN vista (aún no tenemos cta_id)
         # =============================================================
         placeholder_embed = discord.Embed(
             title=f"⚔️ {titulo}",
             description=f"📍 **{ubicacion}**\n⏳ Publicando...",
             color=Config.EMBED_COLOR,
         )
-        # Vista pública con botones (vacía de datos aún)
-        view = CtaAnnouncementView(cta_id=0)  # placeholder; se actualizará después
 
         content = mencionar.mention if mencionar else None
         allowed = (
-            discord.AllowedMentions(roles=[mencionar]) if mencionar else discord.AllowedMentions.none()
+            discord.AllowedMentions(roles=[mencionar])
+            if mencionar
+            else discord.AllowedMentions.none()
         )
-        msg = await channel.send(content=content, embed=placeholder_embed, view=view, allowed_mentions=allowed)
+
+        msg = await channel.send(
+            content=content,
+            embed=placeholder_embed,
+            allowed_mentions=allowed,
+        )
 
         # =============================================================
         # 3. Registrar en el backend
@@ -719,18 +780,23 @@ class CtasCog(commands.Cog):
             "created_by_discord_id": str(interaction.user.id),
             "created_by_name":       interaction.user.display_name,
         }
-        # Eliminar None para no ensuciar el payload
         payload = {k: v for k, v in payload.items() if v is not None}
 
         try:
             result, status = await APIClient.create_cta(payload)
         except (AuthenticationError, AuthorizationError) as exc:
             await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            # Limpieza: borrar el mensaje huérfano
             try:
                 await msg.delete()
             except Exception:
                 pass
+            # Limpieza del evento huérfano
+            if discord_event_id:
+                try:
+                    ev = await interaction.guild.fetch_scheduled_event(int(discord_event_id))
+                    await ev.delete(reason="Rollback por error al registrar CTA")
+                except Exception:
+                    pass
             return
 
         if status != 200 or not result.get("success"):
@@ -742,12 +808,18 @@ class CtasCog(commands.Cog):
                 await msg.delete()
             except Exception:
                 pass
+            if discord_event_id:
+                try:
+                    ev = await interaction.guild.fetch_scheduled_event(int(discord_event_id))
+                    await ev.delete(reason="Rollback por error al registrar CTA")
+                except Exception:
+                    pass
             return
 
         cta_id = result["cta_id"]
 
         # =============================================================
-        # 4. Actualizar el mensaje con el embed real (ya con cta_id)
+        # 4. Actualizar el mensaje con embed real + vista persistente
         # =============================================================
         try:
             cta_result, cta_status = await APIClient.get_cta(cta_id)
@@ -810,7 +882,7 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Necesitamos el message_id del canal para poder refrescar el embed público
+        # Necesitamos el message_id del canal para refrescar el embed público
         msg_id_raw = cta.get("discord_message_id")
         ch_id_raw = cta.get("discord_channel_id")
         try:
@@ -916,7 +988,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Datos para notificar (antes de cancelar en backend)
         participants = [
             p for p in (cta_before.get("participants") or [])
             if p.get("status") == "confirmed" and p.get("discord_user_id")
@@ -983,7 +1054,6 @@ class CtasCog(commands.Cog):
                         msg = await channel.fetch_message(int(msg_id))
                         new_embed = build_cta_embed(cta)
 
-                        # Nueva vista con botones deshabilitados
                         view = CtaAnnouncementView(cta_id=cta_id)
                         for c in view.children:
                             c.disabled = True
@@ -1115,7 +1185,7 @@ class CtasCog(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(text=f"Usa /cta ver <id> para el detalle completo")
+        embed.set_footer(text="Usa /cta ver <id> para el detalle completo")
         await interaction.followup.send(embed=embed)
 
     # ================================================================== #
