@@ -147,3 +147,38 @@ async def is_officer(interaction: discord.Interaction) -> bool:
 
     member_role_ids = {r.id for r in interaction.user.roles}
     return bool(member_role_ids & set(Config.OFFICER_ROLE_IDS))
+
+from datetime import datetime, timezone
+
+# Formatos aceptados para fecha+hora (siempre interpretados como UTC)
+_DATETIME_FORMATS = (
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def parse_datetime(raw: str) -> tuple[str | None, str | None]:
+    """
+    Parsea una fecha+hora escrita por el usuario y devuelve ISO-8601 UTC.
+
+    Retorna (iso_string, error):
+        - Éxito: ("2026-10-15T20:30:00+00:00", None)
+        - Error: (None, "mensaje amigable")
+    """
+    if not raw or not raw.strip():
+        return None, "No se especificó fecha/hora."
+
+    raw = raw.strip()
+    for fmt in _DATETIME_FORMATS:
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            return dt.isoformat(), None
+        except ValueError:
+            continue
+
+    return None, (
+        "Formato inválido. Usa `DD/MM/YYYY HH:MM` "
+        "(ej. `25/09/2026 20:30`) o `YYYY-MM-DD HH:MM`."
+    )

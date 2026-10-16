@@ -30,6 +30,8 @@ COGS = (
     "cogs.reports",
     "cogs.reminders",
     "cogs.registration_panel",
+    "cogs.bank",
+    "cogs.activities",  
 )
 
 

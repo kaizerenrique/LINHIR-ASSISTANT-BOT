@@ -207,3 +207,143 @@ class APIClient:
         if performed_by_discord_id:
             payload["performed_by_discord_id"] = performed_by_discord_id
         return await cls._request("POST", "/register-character", payload)
+    
+    # ============================ Banco personal ============================
+
+    @classmethod
+    async def get_my_balance(cls, discord_user_id: str) -> tuple[dict, int]:
+        """
+        GET /api/bot/members/{discord_user_id}/balance
+        Retorna: {success, personaje_name, balance, ingresos, egresos}
+        """
+        return await cls._get(f"/members/{discord_user_id}/balance")
+
+    # ============================ Retiros ============================
+
+    @classmethod
+    async def create_withdrawal(
+        cls, discord_user_id: str, amount: int
+    ) -> tuple[dict, int]:
+        """
+        POST /api/bot/withdrawals
+        Crea una solicitud de retiro. El backend valida saldo y solicitudes previas.
+        """
+        payload = {"discord_user_id": discord_user_id, "amount": int(amount)}
+        return await cls._request("POST", "/withdrawals", payload)
+
+    @classmethod
+    async def get_my_withdrawals(
+        cls, discord_user_id: str, limit: int = 10
+    ) -> tuple[dict, int]:
+        """
+        GET /api/bot/withdrawals/mine?discord_user_id=X&limit=N
+        Historial del usuario (más recientes primero).
+        """
+        path = f"/withdrawals/mine?discord_user_id={discord_user_id}&limit={int(limit)}"
+        return await cls._get(path)
+
+    @classmethod
+    async def get_pending_withdrawals(cls) -> tuple[dict, int]:
+        """GET /api/bot/withdrawals/pending"""
+        return await cls._get("/withdrawals/pending")
+
+    @classmethod
+    async def approve_withdrawal(
+        cls,
+        withdrawal_id: int,
+        reviewer_discord_id: str,
+        reviewer_name: str,
+    ) -> tuple[dict, int]:
+        """POST /api/bot/withdrawals/{id}/approve"""
+        payload = {
+            "reviewer_discord_id": reviewer_discord_id,
+            "reviewer_name":       reviewer_name,
+        }
+        return await cls._request("POST", f"/withdrawals/{withdrawal_id}/approve", payload)
+
+    @classmethod
+    async def reject_withdrawal(
+        cls,
+        withdrawal_id: int,
+        reviewer_discord_id: str,
+        reviewer_name: str,
+        reason: str,
+    ) -> tuple[dict, int]:
+        """POST /api/bot/withdrawals/{id}/reject"""
+        payload = {
+            "reviewer_discord_id": reviewer_discord_id,
+            "reviewer_name":       reviewer_name,
+            "reason":              reason[:255],
+        }
+        return await cls._request("POST", f"/withdrawals/{withdrawal_id}/reject", payload)
+
+    # ============================ Cuenta del gremio ============================
+
+    @classmethod
+    async def get_guild_balance(cls) -> tuple[dict, int]:
+        """GET /api/bot/guild-balance"""
+        return await cls._get("/guild-balance")
+
+    @classmethod
+    async def get_guild_transactions(
+        cls,
+        limit: int = 15,
+        offset: int = 0,
+        tipo: str | None = None,
+    ) -> tuple[dict, int]:
+        """
+        GET /api/bot/guild-transactions?limit=&offset=&type=
+        `tipo` ∈ {inicial, ingreso, egreso, None}
+        """
+        path = f"/guild-transactions?limit={int(limit)}&offset={int(offset)}"
+        if tipo:
+            path += f"&type={tipo}"
+        return await cls._get(path)
+
+    @classmethod
+    async def create_guild_transaction(
+        cls,
+        tipo: str,
+        amount: int,
+        reason: str,
+        performed_by_discord_id: str,
+        performed_by_name: str,
+        image_url: str | None = None,
+    ) -> tuple[dict, int]:
+        """POST /api/bot/guild-transactions"""
+        payload = {
+            "type":                    tipo,
+            "amount":                  int(amount),
+            "reason":                  reason[:255],
+            "performed_by_discord_id": performed_by_discord_id,
+            "performed_by_name":       performed_by_name,
+        }
+        if image_url:
+            payload["image_url"] = image_url
+        return await cls._request("POST", "/guild-transactions", payload)
+    
+    # ============================ Actividades ============================
+
+    @classmethod
+    async def create_activity(cls, payload: dict) -> tuple[dict, int]:
+        """
+        POST /api/bot/activities
+        Registra una actividad y distribuye silver entre los participantes.
+        El payload debe incluir: name, start_time, end_time, liquid_silver,
+        items_value, pro_guild, participants[], registered_by_discord_id,
+        registered_by_name. `cta_id` es opcional.
+        """
+        return await cls._request("POST", "/activities", payload)
+
+    @classmethod
+    async def get_activities(
+        cls, limit: int = 20, offset: int = 0
+    ) -> tuple[dict, int]:
+        """GET /api/bot/activities?limit=&offset= (más recientes primero)."""
+        path = f"/activities?limit={int(limit)}&offset={int(offset)}"
+        return await cls._get(path)
+
+    @classmethod
+    async def get_activity(cls, activity_id: int) -> tuple[dict, int]:
+        """GET /api/bot/activities/{id} — detalle con participantes."""
+        return await cls._get(f"/activities/{int(activity_id)}")
