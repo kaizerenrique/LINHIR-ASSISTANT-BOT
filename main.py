@@ -33,6 +33,7 @@ COGS = (
     "cogs.bank",
     "cogs.activities",
     "cogs.ctas",  
+    "cogs.compositions",
 )
 
 

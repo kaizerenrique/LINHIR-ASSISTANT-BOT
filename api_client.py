@@ -414,3 +414,33 @@ class APIClient:
     async def mark_reminder_sent(cls, cta_id: int) -> tuple[dict, int]:
         """POST /api/bot/ctas/{id}/reminder-sent"""
         return await cls._request("POST", f"/ctas/{int(cta_id)}/reminder-sent")
+    
+    @classmethod
+    async def create_composition(
+        cls,
+        name: str,
+        description: str | None,
+        weapons: list[dict],
+    ) -> tuple[dict, int]:
+        """
+        POST /api/bot/compositions
+        `weapons` es una lista de {name: str, icon: str | None}
+        """
+        payload = {
+            "name": name[:120],
+            "weapons": [
+                {
+                    "name": w["name"][:120],
+                    "icon": (w.get("icon") or None),
+                }
+                for w in weapons
+            ],
+        }
+        if description:
+            payload["description"] = description[:500]
+        return await cls._request("POST", "/compositions", payload)
+
+    @classmethod
+    async def delete_composition(cls, composition_id: int) -> tuple[dict, int]:
+        """DELETE /api/bot/compositions/{id} — soft delete (active=false)."""
+        return await cls._request("DELETE", f"/compositions/{int(composition_id)}")
