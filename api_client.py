@@ -347,3 +347,70 @@ class APIClient:
     async def get_activity(cls, activity_id: int) -> tuple[dict, int]:
         """GET /api/bot/activities/{id} — detalle con participantes."""
         return await cls._get(f"/activities/{int(activity_id)}")
+    
+    # ============================ Composiciones ============================
+
+    @classmethod
+    async def get_compositions(cls) -> tuple[dict, int]:
+        """GET /api/bot/compositions — lista composiciones activas."""
+        return await cls._get("/compositions")
+
+    # ============================ CTAs ============================
+
+    @classmethod
+    async def get_active_ctas(cls) -> tuple[dict, int]:
+        """GET /api/bot/ctas/active — CTAs programadas futuras."""
+        return await cls._get("/ctas/active")
+
+    @classmethod
+    async def get_cta(cls, cta_id: int) -> tuple[dict, int]:
+        """GET /api/bot/ctas/{id} — detalle con armas y participantes."""
+        return await cls._get(f"/ctas/{int(cta_id)}")
+
+    @classmethod
+    async def create_cta(cls, payload: dict) -> tuple[dict, int]:
+        """
+        POST /api/bot/ctas
+        Registra una CTA. El bot debe haber creado ya el evento y mensaje
+        de Discord, y pasa sus IDs aquí.
+        """
+        return await cls._request("POST", "/ctas", payload)
+
+    @classmethod
+    async def cta_join(
+        cls,
+        cta_id: int,
+        discord_user_id: str,
+        user_name: str,
+        weapon_id: int,
+    ) -> tuple[dict, int]:
+        """POST /api/bot/ctas/{id}/join"""
+        payload = {
+            "discord_user_id": discord_user_id,
+            "user_name":       user_name,
+            "weapon_id":       int(weapon_id),
+        }
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/join", payload)
+
+    @classmethod
+    async def cta_absent(
+        cls, cta_id: int, discord_user_id: str
+    ) -> tuple[dict, int]:
+        """POST /api/bot/ctas/{id}/absent"""
+        payload = {"discord_user_id": discord_user_id}
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/absent", payload)
+
+    @classmethod
+    async def cta_cancel(cls, cta_id: int) -> tuple[dict, int]:
+        """POST /api/bot/ctas/{id}/cancel"""
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/cancel")
+
+    @classmethod
+    async def get_pending_reminders(cls) -> tuple[dict, int]:
+        """GET /api/bot/ctas/pending-reminders"""
+        return await cls._get("/ctas/pending-reminders")
+
+    @classmethod
+    async def mark_reminder_sent(cls, cta_id: int) -> tuple[dict, int]:
+        """POST /api/bot/ctas/{id}/reminder-sent"""
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/reminder-sent")

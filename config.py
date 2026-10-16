@@ -53,6 +53,15 @@ class Config:
     # --- Canal de identificación (panel de registro) ---
     IDENTIFY_CHANNEL_ID = _int_env("IDENTIFY_CHANNEL_ID")
 
+    # --- Canal de anuncios de CTAs ---
+    CTA_ANNOUNCE_CHANNEL_ID = _int_env("CTA_ANNOUNCE_CHANNEL_ID")
+
+    # --- Poller de recordatorios (segundos entre ciclos) ---
+    CTA_REMINDER_POLL_SECONDS = _int_env("CTA_REMINDER_POLL_SECONDS", 60)
+
+    # --- Duración mínima de una CTA (minutos) ---
+    CTA_MIN_DURATION_MIN = _int_env("CTA_MIN_DURATION_MIN", 15)
+
     @classmethod
     def report_hour_and_minute(cls) -> tuple[int, int]:
         """Parsea 'HH:MM' y devuelve (hora, minuto). Fallback a 12:00."""
@@ -98,3 +107,6 @@ class Config:
                 "PUBLICO_ROLE_ID no configurado en .env. "
                 "Copia el ID del rol @Publico desde Discord."
             )
+        if not cls.CTA_ANNOUNCE_CHANNEL_ID:
+            logger_name = "Config"
+            # No es fatal: solo bloquea /cta crear. Lo validamos en el comando.
