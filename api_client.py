@@ -444,3 +444,31 @@ class APIClient:
     async def delete_composition(cls, composition_id: int) -> tuple[dict, int]:
         """DELETE /api/bot/compositions/{id} — soft delete (active=false)."""
         return await cls._request("DELETE", f"/compositions/{int(composition_id)}")
+    
+    # ============================ Listado de CTAs ============================
+
+    @classmethod
+    async def get_ctas(
+        cls,
+        status: str | None = None,
+        paid: bool | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        order: str = "desc",
+    ) -> tuple[dict, int]:
+        """
+        GET /api/bot/ctas?status=&paid=&limit=&offset=&order=
+        Listado de CTAs con filtros opcionales.
+        """
+        params = [f"limit={int(limit)}", f"offset={int(offset)}", f"order={order}"]
+        if status:
+            params.append(f"status={status}")
+        if paid is not None:
+            params.append(f"paid={'true' if paid else 'false'}")
+        path = "/ctas?" + "&".join(params)
+        return await cls._get(path)
+
+    @classmethod
+    async def get_pending_payment_ctas(cls) -> tuple[dict, int]:
+        """GET /api/bot/ctas/pending-payment — CTAs pasadas sin pagar."""
+        return await cls._get("/ctas/pending-payment")

@@ -127,6 +127,10 @@ class ActivityBuilderView(discord.ui.View):
     """
     Panel interactivo que el oficial completa antes de confirmar.
 
+    Puede arrancar:
+      - Vacío (uso desde /actividad registrar)
+      - Con participantes precargados (uso desde /cta pagar)
+
     El `message` se asigna externamente después de enviar (`view.message = msg`)
     para poder editar el mensaje original desde el modal.
     """
@@ -136,13 +140,14 @@ class ActivityBuilderView(discord.ui.View):
         author_id: int,
         base_payload: dict,
         personajes: list[dict],
+        preseed_participants: list[dict] | None = None,
         timeout: int = 900,
     ):
         super().__init__(timeout=timeout)
         self.author_id = author_id
         self.base_payload = base_payload
         self.personajes = personajes
-        self.participants: list[dict] = []
+        self.participants: list[dict] = list(preseed_participants or [])
         self.confirmed = False
         self.message: discord.Message | None = None
 
@@ -271,6 +276,74 @@ class ActivityBuilderView(discord.ui.View):
             )
             return
         await interaction.response.send_modal(AddParticipantModal(self))
+
+    @discord.ui.button(
+        label="Quitar participante",
+        style=discord.ButtonStyle.secondary,
+        emoji="🗑️",
+        row=0,
+    )
+    async def remove_participant_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if self.confirmed:
+            await interaction.response.send_message(
+                "⚠️ La actividad ya fue confirmada.", ephemeral=True
+            )
+            return
+
+        if not self.participants:
+            await interaction.response.send_message(
+                "ℹ️ No hay participantes que quitar.", ephemeral=True
+            )
+            return
+
+        # Select con los participantes actuales (máx 25)
+        options = [
+            discord.SelectOption(
+                label=p["name"][:90],
+                description=f"{p['percent']:.0f}%",
+                value=str(i),
+            )
+            for i, p in enumerate(self.participants[:25])
+        ]
+
+        select = discord.ui.Select(
+            placeholder="Elige el participante a quitar...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+        async def _on_remove(sel_interaction: discord.Interaction):
+            if sel_interaction.user.id != self.author_id:
+                await sel_interaction.response.send_message(
+                    "❌ Solo el autor puede modificar.", ephemeral=True
+                )
+                return
+
+            idx = int(select.values[0])
+            removed = self.participants.pop(idx)
+
+            try:
+                if self.message:
+                    await self.message.edit(embed=self.build_embed(), view=self)
+                await sel_interaction.response.send_message(
+                    f"🗑️ Quitado: **{removed['name']}**", ephemeral=True
+                )
+            except discord.HTTPException as exc:
+                logger.warning("No se pudo refrescar panel tras quitar: %s", exc)
+
+        select.callback = _on_remove
+
+        remove_view = discord.ui.View(timeout=60)
+        remove_view.add_item(select)
+
+        await interaction.response.send_message(
+            "Selecciona a quién quitar:",
+            view=remove_view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(
         label="Confirmar",
@@ -530,7 +603,7 @@ class ActivitiesCog(commands.Cog):
 
     @actividad.command(
         name="registrar",
-        description="[Oficiales] Registra una actividad y distribuye el botín",
+        description="[Oficiales] Registra una actividad manualmente (sin CTA)",
     )
     @app_commands.describe(
         nombre="Nombre de la actividad (ej: 'Fame Farm Rojo')",
@@ -539,7 +612,6 @@ class ActivitiesCog(commands.Cog):
         fin="Fin en formato DD/MM/YYYY HH:MM (UTC)",
         items="Valor estimado de los items (opcional)",
         pro_gremio="Si es True, todo el botín va a la cuenta del gremio",
-        cta_id="ID de la CTA asociada (opcional)",
     )
     async def registrar(
         self,
@@ -550,7 +622,6 @@ class ActivitiesCog(commands.Cog):
         fin: str,
         items: int = 0,
         pro_gremio: bool = False,
-        cta_id: int | None = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -593,8 +664,6 @@ class ActivitiesCog(commands.Cog):
             "registered_by_discord_id": str(interaction.user.id),
             "registered_by_name":       interaction.user.display_name,
         }
-        if cta_id:
-            base_payload["cta_id"] = int(cta_id)
 
         # =============================================================
         # Modo pro-gremio: sin panel interactivo, todo directo
@@ -628,8 +697,6 @@ class ActivitiesCog(commands.Cog):
                 ),
                 color=Config.EMBED_COLOR,
             )
-            if cta_id:
-                embed.add_field(name="CTA", value=f"`#{cta_id}` (marcada como pagada)")
             embed.set_footer(text=f"ID actividad #{activity.get('id', '?')}")
             await interaction.followup.send(embed=embed)
             return
@@ -671,8 +738,6 @@ class ActivitiesCog(commands.Cog):
             personajes=personajes,
         )
 
-        # Enviamos al canal (no efímero) y guardamos la referencia al mensaje
-        # para poder editarlo desde el modal
         panel_msg = await interaction.followup.send(
             embed=view.build_embed(), view=view
         )

@@ -1,4 +1,4 @@
-"""Cog de CTAs: creación, inscripción, ausencias y recordatorios."""
+"""Cog de CTAs: creación, inscripción, ausencias, pagos y recordatorios."""
 
 import logging
 from datetime import datetime, timezone
@@ -81,7 +81,7 @@ class WeaponSelect(discord.ui.Select):
                         f"Ocupada por {taken_by}" if taken_by else "Libre"
                     )[:100],
                     value=str(wid),
-                    emoji=icon,          # None si es inválido → Discord lo acepta
+                    emoji=icon,
                 )
             )
 
@@ -155,10 +155,6 @@ class WeaponSelect(discord.ui.Select):
         # Refrescar el embed público
         await self.view.refresh_public_message()
 
-
-# ===================================================================== #
-#              Vista con Select(s) de armas + botón Cancelar            #
-# ===================================================================== #
 
 # ===================================================================== #
 #              Vista con Select(s) de armas + botón Cancelar            #
@@ -394,6 +390,7 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     title = cta.get("title", "—")
     location = cta.get("location", "—")
     status = cta.get("status", "scheduled")
+    paid = cta.get("paid", False)
     composition = cta.get("composition") or {}
     weapons = composition.get("weapons") or []
     participants = cta.get("participants") or []
@@ -401,7 +398,7 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     color_map = {
         "scheduled": Config.EMBED_COLOR,
         "cancelled": 0xFF5252,
-        "completed": 0x6D6D6D,
+        "completed": 0x5CCB45,
     }
     color = color_map.get(status, Config.EMBED_COLOR)
 
@@ -438,7 +435,12 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     if status == "cancelled":
         embed.add_field(name="Estado", value="❌ **Cancelada**", inline=True)
     elif status == "completed":
-        embed.add_field(name="Estado", value="✅ Completada", inline=True)
+        estado_txt = "✅ Completada"
+        if paid:
+            estado_txt += " · 💵 Pagada"
+        embed.add_field(name="Estado", value=estado_txt, inline=True)
+    elif paid:
+        embed.add_field(name="Estado", value="💵 **Pagada**", inline=True)
 
     # Ocupación de armas
     occupancy: dict[int, str | None] = {}
@@ -790,7 +792,6 @@ class CtasCog(commands.Cog):
                 await msg.delete()
             except Exception:
                 pass
-            # Limpieza del evento huérfano
             if discord_event_id:
                 try:
                     ev = await interaction.guild.fetch_scheduled_event(int(discord_event_id))
@@ -1108,6 +1109,222 @@ class CtasCog(commands.Cog):
             cta_id, interaction.user, event_status, notified, len(participants),
         )
 
+    # ------------------- /cta pagar -------------------
+
+    @cta_group.command(
+        name="pagar",
+        description="[Oficiales] Paga una CTA y distribuye el botín entre sus participantes",
+    )
+    @app_commands.describe(
+        cta_id="ID de la CTA a pagar (ver /ctas)",
+        silver="Silver líquido recolectado",
+        items="Valor estimado de los items (opcional)",
+        pro_gremio="Si es True, TODO el botín va al gremio (sin repartir)",
+    )
+    async def pagar(
+        self,
+        interaction: discord.Interaction,
+        cta_id: int,
+        silver: int,
+        items: int = 0,
+        pro_gremio: bool = False,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if not await is_officer(interaction):
+            await interaction.followup.send(
+                "❌ Solo oficiales pueden pagar CTAs.", ephemeral=True
+            )
+            return
+
+        if silver < 0 or items < 0:
+            await interaction.followup.send(
+                "❌ Los montos no pueden ser negativos.", ephemeral=True
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # 1. Cargar la CTA
+        # ------------------------------------------------------------------
+        try:
+            result, status = await APIClient.get_cta(cta_id)
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+
+        if status != 200 or not result.get("success"):
+            await interaction.followup.send(
+                f"❌ {result.get('reason', 'CTA no encontrada.')}", ephemeral=True
+            )
+            return
+
+        cta = result["cta"]
+
+        # Validaciones
+        if cta.get("paid"):
+            await interaction.followup.send(
+                f"⚠️ La CTA **#{cta_id}** ya fue pagada.", ephemeral=True
+            )
+            return
+        if cta.get("status") == "cancelled":
+            await interaction.followup.send(
+                f"⚠️ La CTA **#{cta_id}** está cancelada. No se puede pagar.",
+                ephemeral=True,
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # 2. Modo pro-gremio → directo, sin panel
+        # ------------------------------------------------------------------
+        if pro_gremio:
+            payload = {
+                "cta_id":                    cta_id,
+                "name":                      cta.get("title", f"CTA #{cta_id}"),
+                "start_time":                cta["start_time"],
+                "end_time":                  cta["end_time"],
+                "liquid_silver":             int(silver),
+                "items_value":               int(items),
+                "pro_guild":                 True,
+                "participants":              [],
+                "registered_by_discord_id":  str(interaction.user.id),
+                "registered_by_name":        interaction.user.display_name,
+            }
+
+            try:
+                r, s = await APIClient.create_activity(payload)
+            except (AuthenticationError, AuthorizationError) as exc:
+                await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+                return
+
+            if s != 200 or not r.get("success"):
+                await interaction.followup.send(
+                    f"❌ {r.get('reason', 'No se pudo registrar.')}",
+                    ephemeral=True,
+                )
+                return
+
+            total_bruto = int(silver) + int(items)
+            embed = discord.Embed(
+                title="✅ CTA pagada como pro-gremio",
+                description=(
+                    f"**{cta.get('title', f'CTA #{cta_id}')}**\n\n"
+                    f"Silver: `{format_number(silver)}`\n"
+                    f"Items: `{format_number(items)}`\n"
+                    f"**Total al gremio:** `{format_number(total_bruto)}` plata"
+                ),
+                color=Config.EMBED_COLOR,
+            )
+            embed.set_footer(text=f"CTA #{cta_id} marcada como pagada")
+            await interaction.followup.send(embed=embed)
+            return
+
+        # ------------------------------------------------------------------
+        # 3. Modo normal → precargar participantes y abrir panel
+        # ------------------------------------------------------------------
+        # Cargar miembros del gremio (para validar personajes)
+        try:
+            members_data, members_status = await APIClient.get_registered_members()
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+
+        if members_status != 200 or not members_data.get("success"):
+            await interaction.followup.send(
+                "❌ No se pudo cargar la lista de miembros.", ephemeral=True
+            )
+            return
+
+        guild_registered = members_data.get("guild_registered", [])
+        personajes = [
+            {
+                "name":            p["name"],
+                "discord_user_id": str(p["discord_user_id"]),
+            }
+            for p in guild_registered
+        ]
+        personajes_by_uid = {p["discord_user_id"]: p["name"] for p in personajes}
+
+        # Participantes confirmados de la CTA (excluyendo ausentes)
+        confirmed = [
+            p for p in (cta.get("participants") or [])
+            if p.get("status") == "confirmed"
+        ]
+
+        if not confirmed:
+            await interaction.followup.send(
+                f"⚠️ La CTA **#{cta_id}** no tiene participantes confirmados.",
+                ephemeral=True,
+            )
+            return
+
+        # Precargar solo los que están vinculados a un personaje
+        preseed = []
+        sin_personaje = []
+        for p in confirmed:
+            uid = str(p.get("discord_user_id", ""))
+            if uid in personajes_by_uid:
+                preseed.append({
+                    "discord_user_id": uid,
+                    "name":            personajes_by_uid[uid],
+                    "percent":         100,
+                })
+            else:
+                sin_personaje.append(p.get("user_name", "—"))
+
+        if not preseed:
+            await interaction.followup.send(
+                "⚠️ Ninguno de los participantes de la CTA tiene personaje "
+                "vinculado en el gremio. No se puede distribuir.",
+                ephemeral=True,
+            )
+            return
+
+        # Import local para evitar circular imports
+        from cogs.activities import ActivityBuilderView
+
+        base_payload = {
+            "cta_id":                    cta_id,
+            "name":                      cta.get("title", f"CTA #{cta_id}"),
+            "start_time":                cta["start_time"],
+            "end_time":                  cta["end_time"],
+            "liquid_silver":             int(silver),
+            "items_value":               int(items),
+            "pro_guild":                 False,
+            "registered_by_discord_id":  str(interaction.user.id),
+            "registered_by_name":        interaction.user.display_name,
+        }
+
+        view = ActivityBuilderView(
+            author_id=interaction.user.id,
+            base_payload=base_payload,
+            personajes=personajes,
+            preseed_participants=preseed,
+        )
+
+        panel_msg = await interaction.channel.send(
+            content=(
+                f"💰 **Pago de CTA #{cta_id}** · {cta.get('title', '')}\n"
+                f"Participantes precargados: **{len(preseed)}**\n"
+                f"*(Revisa la lista, quita a quien no asistió, ajusta % y confirma)*"
+            ),
+            embed=view.build_embed(),
+            view=view,
+        )
+        view.message = panel_msg
+
+        # Aviso al oficial si hubo participantes sin personaje
+        if sin_personaje:
+            await interaction.followup.send(
+                f"⚠️ **Sin personaje vinculado** (no se incluyen):\n"
+                + "\n".join(f"• {n}" for n in sin_personaje[:10]),
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ Panel de pago abierto para la CTA **#{cta_id}**.",
+                ephemeral=True,
+            )
+
     # ------------------- /cta ver -------------------
 
     @cta_group.command(
@@ -1133,17 +1350,72 @@ class CtasCog(commands.Cog):
         embed = build_cta_embed(result["cta"])
         await interaction.followup.send(embed=embed)
 
-    # ------------------- /ctas (lista) -------------------
+    # ------------------- /ctas (lista con filtros) -------------------
 
     @app_commands.command(
         name="ctas",
-        description="Lista las próximas CTAs programadas",
+        description="Lista CTAs por estado (programadas, por pagar, pagadas, canceladas)",
     )
-    async def listar(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        filtro="Qué CTAs listar (default: programadas)",
+        limite="Cuántas mostrar (5-25)",
+    )
+    @app_commands.choices(filtro=[
+        app_commands.Choice(name="⚔️  Programadas",  value="scheduled"),
+        app_commands.Choice(name="💰  Por pagar",    value="por_pagar"),
+        app_commands.Choice(name="✅  Pagadas",      value="pagadas"),
+        app_commands.Choice(name="❌  Canceladas",   value="cancelled"),
+        app_commands.Choice(name="📜  Todas",        value="all"),
+    ])
+    async def listar(
+        self,
+        interaction: discord.Interaction,
+        filtro: app_commands.Choice[str] | None = None,
+        limite: int = 15,
+    ):
         await interaction.response.defer(thinking=True)
 
+        limite = max(5, min(25, limite))
+        filtro_val = filtro.value if filtro else "scheduled"
+
+        # ---------------------------------------------------------------
+        # Cargar datos según el filtro
+        # ---------------------------------------------------------------
         try:
-            result, status = await APIClient.get_active_ctas()
+            if filtro_val == "scheduled":
+                result, status = await APIClient.get_ctas(
+                    status="scheduled", paid=False, limit=limite
+                )
+                titulo = "⚔️ CTAs programadas"
+                subtitulo = "Próximas actividades sin pagar"
+
+            elif filtro_val == "por_pagar":
+                result, status = await APIClient.get_pending_payment_ctas()
+                titulo = "💰 CTAs por pagar"
+                subtitulo = "Actividades pasadas pendientes de pago"
+                # Recortar al límite local
+                if result.get("ctas"):
+                    result["ctas"] = result["ctas"][:limite]
+
+            elif filtro_val == "pagadas":
+                result, status = await APIClient.get_ctas(
+                    paid=True, limit=limite
+                )
+                titulo = "✅ CTAs pagadas"
+                subtitulo = "Últimas actividades liquidadas"
+
+            elif filtro_val == "cancelled":
+                result, status = await APIClient.get_ctas(
+                    status="cancelled", limit=limite
+                )
+                titulo = "❌ CTAs canceladas"
+                subtitulo = "Actividades canceladas por oficiales"
+
+            else:  # all
+                result, status = await APIClient.get_ctas(limit=limite)
+                titulo = "📜 Historial de CTAs"
+                subtitulo = "Todas las actividades registradas"
+
         except (AuthenticationError, AuthorizationError) as exc:
             await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
             return
@@ -1156,11 +1428,17 @@ class CtasCog(commands.Cog):
 
         ctas = result.get("ctas", [])
         if not ctas:
-            await interaction.followup.send("📭 No hay CTAs programadas.")
+            await interaction.followup.send(
+                f"📭 No hay CTAs en la categoría **{filtro_val}**."
+            )
             return
 
+        # ---------------------------------------------------------------
+        # Construir embed
+        # ---------------------------------------------------------------
         embed = discord.Embed(
-            title=f"⚔️ Próximas CTAs ({len(ctas)})",
+            title=titulo,
+            description=f"*{subtitulo}* · {len(ctas)} resultado(s)",
             color=Config.EMBED_COLOR,
         )
 
@@ -1175,17 +1453,39 @@ class CtasCog(commands.Cog):
                 pass
 
             comp = (cta.get("composition") or {}).get("name", "—")
+            status_txt = cta.get("status", "?")
+            paid = cta.get("paid", False)
+            cta_id = cta.get("id", "?")
+
+            # Estado visual
+            badges = []
+            if status_txt == "scheduled":
+                badges.append("🕐 programada" if not paid else "💳 sin marcar")
+            elif status_txt == "cancelled":
+                badges.append("❌ cancelada")
+            elif status_txt == "completed":
+                badges.append("✅ completada")
+            if paid:
+                badges.append("💵 pagada")
+
+            badge_str = " · ".join(badges) if badges else ""
+
             embed.add_field(
-                name=f"#{cta['id']} · {cta['title'][:70]}",
+                name=f"#{cta_id} · {cta.get('title', '—')[:70]}",
                 value=(
                     f"📍 {cta.get('location', '—')}\n"
-                    f"🎭 {comp}\n"
-                    f"⏰ {time_str}"
+                    f"🎭 {comp} · 👥 {cta.get('confirmed_count', 0)}\n"
+                    f"⏰ {time_str}\n"
+                    f"{badge_str}"
                 ),
                 inline=False,
             )
 
-        embed.set_footer(text="Usa /cta ver <id> para el detalle completo")
+        if len(ctas) > 15:
+            embed.set_footer(text=f"… y {len(ctas) - 15} más · Filtro: {filtro_val}")
+        else:
+            embed.set_footer(text=f"Filtro: {filtro_val}")
+
         await interaction.followup.send(embed=embed)
 
     # ================================================================== #
