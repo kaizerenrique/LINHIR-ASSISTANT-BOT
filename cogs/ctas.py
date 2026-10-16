@@ -69,7 +69,6 @@ class WeaponSelect(discord.ui.Select):
             wid = w["id"]
             taken_by = occupancy.get(str(wid)) or occupancy.get(wid)
 
-            # Sanear emoji: si es inválido, no pasarlo a Discord
             icon_raw = w.get("weapon_icon")
             icon = sanitize_emoji(icon_raw) if icon_raw else None
 
@@ -106,7 +105,6 @@ class WeaponSelect(discord.ui.Select):
 
         weapon_id = int(self.values[0])
 
-        # Verificación "amistosa" local (el backend valida de nuevo con lock)
         taken_by = self.occupancy.get(str(weapon_id)) or self.occupancy.get(weapon_id)
         if taken_by:
             await interaction.response.send_message(
@@ -135,7 +133,6 @@ class WeaponSelect(discord.ui.Select):
             )
             return
 
-        # Nombre del arma elegida (buscamos en todas las armas de la vista)
         weapon_name = "—"
         for w in self.view.all_weapons:
             if w["id"] == weapon_id:
@@ -152,7 +149,6 @@ class WeaponSelect(discord.ui.Select):
         )
         await interaction.edit_original_response(embed=embed, view=None)
 
-        # Refrescar el embed público
         await self.view.refresh_public_message()
 
 
@@ -167,14 +163,10 @@ class WeaponSelectView(discord.ui.View):
     Si la composición tiene >25 armas, se crean múltiples Selects en
     filas separadas (hasta 4 filas = 100 armas). El botón Cancelar
     ocupa la última fila disponible.
-
-    NOTA: el botón Cancelar NO usa el decorador @discord.ui.button porque
-    se auto-registraría en la fila 0 durante super().__init__() y
-    chocaría con los Selects. Se crea y añade manualmente.
     """
 
     MAX_WEAPONS_PER_SELECT = 25
-    MAX_ROWS_FOR_SELECTS = 4    # 4 filas × 25 = 100 armas máx
+    MAX_ROWS_FOR_SELECTS = 4
 
     def __init__(
         self,
@@ -188,17 +180,15 @@ class WeaponSelectView(discord.ui.View):
     ):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
-        self.all_weapons = weapons       # guardamos TODAS para buscar por id
+        self.all_weapons = weapons
         self.channel_id = channel_id
         self.message_id = message_id
 
-        # Trocear armas en chunks de 25
         chunks = [
             weapons[i:i + self.MAX_WEAPONS_PER_SELECT]
             for i in range(0, len(weapons), self.MAX_WEAPONS_PER_SELECT)
         ]
 
-        # Limitar a las primeras 4 filas (dejamos la 5ª para el botón Cancelar)
         if len(chunks) > self.MAX_ROWS_FOR_SELECTS:
             logger.warning(
                 "Composición con %d armas: mostrando solo %d (límite de filas en Discord)",
@@ -224,7 +214,6 @@ class WeaponSelectView(discord.ui.View):
                 )
             )
 
-        # --- Botón Cancelar creado manualmente para controlar su fila ---
         cancel_row = min(len(chunks), 4)
         cancel_btn = discord.ui.Button(
             label="Cancelar",
@@ -262,18 +251,12 @@ class WeaponSelectView(discord.ui.View):
 # ===================================================================== #
 
 class CtaAnnouncementView(discord.ui.View):
-    """
-    Vista pública del mensaje de CTA.
-
-    Al arrancar el bot, se registra con `bot.add_view(view, message_id=...)`
-    para sobrevivir reinicios.
-    """
+    """Vista pública del mensaje de CTA."""
 
     def __init__(self, cta_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
 
-        # custom_id estables por CTA (aunque también registramos por message_id)
         self.join_btn.custom_id = f"cta:join:{cta_id}"
         self.absent_btn.custom_id = f"cta:absent:{cta_id}"
         self.refresh_btn.custom_id = f"cta:refresh:{cta_id}"
@@ -285,7 +268,6 @@ class CtaAnnouncementView(discord.ui.View):
         row=0,
     )
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Obtener CTA fresca para conocer composición + ocupación actual
         try:
             result, status = await APIClient.get_cta(self.cta_id)
         except (AuthenticationError, AuthorizationError) as exc:
@@ -358,7 +340,6 @@ class CtaAnnouncementView(discord.ui.View):
             ephemeral=True,
         )
 
-        # Refrescar mensaje público
         await self._refresh_public(interaction)
 
     @discord.ui.button(
@@ -408,7 +389,6 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         color=color,
     )
 
-    # Fechas con timestamp relativo
     start_iso = cta.get("start_time")
     end_iso = cta.get("end_time")
     if start_iso:
@@ -431,7 +411,6 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         except (ValueError, TypeError):
             embed.add_field(name="🏁 Fin", value=end_iso, inline=True)
 
-    # Estado
     if status == "cancelled":
         embed.add_field(name="Estado", value="❌ **Cancelada**", inline=True)
     elif status == "completed":
@@ -442,7 +421,6 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     elif paid:
         embed.add_field(name="Estado", value="💵 **Pagada**", inline=True)
 
-    # Ocupación de armas
     occupancy: dict[int, str | None] = {}
     for p in participants:
         if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
@@ -452,7 +430,6 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         lines = []
         for w in weapons[:20]:
             taken = occupancy.get(w["id"])
-            # Sanear emoji (dato legacy podría ser inválido)
             icon = sanitize_emoji(w.get("weapon_icon")) or "•"
             name = w["weapon_name"]
             if taken:
@@ -469,7 +446,6 @@ def build_cta_embed(cta: dict) -> discord.Embed:
             inline=False,
         )
 
-    # Confirmados
     confirmed = [p for p in participants if p.get("status") == "confirmed"]
     absent    = [p for p in participants if p.get("status") == "absent"]
 
@@ -509,9 +485,7 @@ class CtasCog(commands.Cog):
     # ================================================================== #
 
     async def cog_load(self):
-        # Registrar vistas persistentes de CTAs activas
         await self._register_persistent_views()
-        # Arrancar el poller de recordatorios
         self.reminder_loop.start()
 
     async def cog_unload(self):
@@ -592,11 +566,9 @@ class CtasCog(commands.Cog):
             participants = cta.get("confirmed_participants") or []
 
             if not participants:
-                # Marcar como enviado para no volver a procesarla
                 await APIClient.mark_reminder_sent(cta_id)
                 continue
 
-            # Timestamp relativo para el DM
             start_fmt = start_iso
             try:
                 start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
@@ -629,7 +601,6 @@ class CtasCog(commands.Cog):
                     failed += 1
                     logger.warning("DM fallo para %s: %s", uid, exc)
 
-            # Marcar como enviado aunque algunos DMs fallaran
             await APIClient.mark_reminder_sent(cta_id)
 
             logger.info(
@@ -692,7 +663,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Validar fechas
         start_iso, err = parse_datetime(inicio)
         if err:
             await interaction.followup.send(f"❌ Inicio: {err}", ephemeral=True)
@@ -709,7 +679,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Validar composición
         try:
             composition_id = int(composicion)
         except (ValueError, TypeError):
@@ -720,9 +689,7 @@ class CtasCog(commands.Cog):
 
         recordatorio = max(1, min(120, recordatorio))
 
-        # =============================================================
         # 1. Crear evento de Discord
-        # =============================================================
         discord_event_id = None
         try:
             start_dt = datetime.fromisoformat(start_iso)
@@ -743,9 +710,7 @@ class CtasCog(commands.Cog):
         except Exception as exc:
             logger.exception("Error creando evento: %s", exc)
 
-        # =============================================================
-        # 2. Enviar mensaje placeholder SIN vista (aún no tenemos cta_id)
-        # =============================================================
+        # 2. Enviar mensaje placeholder SIN vista
         placeholder_embed = discord.Embed(
             title=f"⚔️ {titulo}",
             description=f"📍 **{ubicacion}**\n⏳ Publicando...",
@@ -765,9 +730,7 @@ class CtasCog(commands.Cog):
             allowed_mentions=allowed,
         )
 
-        # =============================================================
         # 3. Registrar en el backend
-        # =============================================================
         payload = {
             "composition_id":        composition_id,
             "title":                 titulo[:120],
@@ -819,9 +782,7 @@ class CtasCog(commands.Cog):
 
         cta_id = result["cta_id"]
 
-        # =============================================================
-        # 4. Actualizar el mensaje con embed real + vista persistente
-        # =============================================================
+        # 4. Actualizar mensaje con embed real + vista persistente
         try:
             cta_result, cta_status = await APIClient.get_cta(cta_id)
             if cta_status == 200 and cta_result.get("success"):
@@ -883,7 +844,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Necesitamos el message_id del canal para refrescar el embed público
         msg_id_raw = cta.get("discord_message_id")
         ch_id_raw = cta.get("discord_channel_id")
         try:
@@ -964,9 +924,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # ---------------------------------------------------------------
-        # 1. Obtener CTA ANTES de cancelarla (necesitamos los IDs de Discord)
-        # ---------------------------------------------------------------
         try:
             pre_result, pre_status = await APIClient.get_cta(cta_id)
         except (AuthenticationError, AuthorizationError) as exc:
@@ -995,9 +952,6 @@ class CtasCog(commands.Cog):
         ]
         cta_title = cta_before.get("title", "—")
 
-        # ---------------------------------------------------------------
-        # 2. Cancelar en backend
-        # ---------------------------------------------------------------
         try:
             result, status = await APIClient.cta_cancel(cta_id)
         except (AuthenticationError, AuthorizationError) as exc:
@@ -1010,9 +964,7 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # ---------------------------------------------------------------
-        # 3. Eliminar el evento programado de Discord (si existe)
-        # ---------------------------------------------------------------
+        # Eliminar evento de Discord
         event_id = cta_before.get("discord_event_id")
         event_status = "sin evento vinculado"
 
@@ -1040,9 +992,7 @@ class CtasCog(commands.Cog):
                 event_status = f"⚠️ error HTTP ({exc.status}) al eliminar el evento"
                 logger.exception("Error HTTP eliminando evento %s: %s", event_id, exc)
 
-        # ---------------------------------------------------------------
-        # 4. Actualizar el mensaje público (embed + botones deshabilitados)
-        # ---------------------------------------------------------------
+        # Actualizar mensaje público
         try:
             cta_result, cta_status = await APIClient.get_cta(cta_id)
             if cta_status == 200 and cta_result.get("success"):
@@ -1063,9 +1013,7 @@ class CtasCog(commands.Cog):
         except Exception as exc:
             logger.warning("No se pudo actualizar mensaje de CTA cancelada: %s", exc)
 
-        # ---------------------------------------------------------------
-        # 5. Notificar por DM a los inscritos
-        # ---------------------------------------------------------------
+        # Notificar por DM
         notified = 0
         failed_notify = 0
 
@@ -1087,9 +1035,6 @@ class CtasCog(commands.Cog):
                     failed_notify += 1
                     logger.warning("DM fallo al notificar cancelación: %s", exc)
 
-        # ---------------------------------------------------------------
-        # 6. Confirmación al oficial
-        # ---------------------------------------------------------------
         summary_lines = [
             f"✅ CTA **#{cta_id}** cancelada.",
             f"📅 Evento: {event_status}",
@@ -1109,7 +1054,7 @@ class CtasCog(commands.Cog):
             cta_id, interaction.user, event_status, notified, len(participants),
         )
 
-    # ------------------- /cta pagar -------------------
+    # ------------------- /cta pagar (NUEVO) -------------------
 
     @cta_group.command(
         name="pagar",
@@ -1221,7 +1166,6 @@ class CtasCog(commands.Cog):
         # ------------------------------------------------------------------
         # 3. Modo normal → precargar participantes y abrir panel
         # ------------------------------------------------------------------
-        # Cargar miembros del gremio (para validar personajes)
         try:
             members_data, members_status = await APIClient.get_registered_members()
         except (AuthenticationError, AuthorizationError) as exc:
@@ -1244,7 +1188,6 @@ class CtasCog(commands.Cog):
         ]
         personajes_by_uid = {p["discord_user_id"]: p["name"] for p in personajes}
 
-        # Participantes confirmados de la CTA (excluyendo ausentes)
         confirmed = [
             p for p in (cta.get("participants") or [])
             if p.get("status") == "confirmed"
@@ -1257,7 +1200,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Precargar solo los que están vinculados a un personaje
         preseed = []
         sin_personaje = []
         for p in confirmed:
@@ -1279,7 +1221,7 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # Import local para evitar circular imports
+        # Import local para evitar circular imports (activities ↔ ctas)
         from cogs.activities import ActivityBuilderView
 
         base_payload = {
@@ -1312,7 +1254,6 @@ class CtasCog(commands.Cog):
         )
         view.message = panel_msg
 
-        # Aviso al oficial si hubo participantes sin personaje
         if sin_personaje:
             await interaction.followup.send(
                 f"⚠️ **Sin personaje vinculado** (no se incluyen):\n"
@@ -1378,9 +1319,6 @@ class CtasCog(commands.Cog):
         limite = max(5, min(25, limite))
         filtro_val = filtro.value if filtro else "scheduled"
 
-        # ---------------------------------------------------------------
-        # Cargar datos según el filtro
-        # ---------------------------------------------------------------
         try:
             if filtro_val == "scheduled":
                 result, status = await APIClient.get_ctas(
@@ -1393,7 +1331,6 @@ class CtasCog(commands.Cog):
                 result, status = await APIClient.get_pending_payment_ctas()
                 titulo = "💰 CTAs por pagar"
                 subtitulo = "Actividades pasadas pendientes de pago"
-                # Recortar al límite local
                 if result.get("ctas"):
                     result["ctas"] = result["ctas"][:limite]
 
@@ -1433,9 +1370,6 @@ class CtasCog(commands.Cog):
             )
             return
 
-        # ---------------------------------------------------------------
-        # Construir embed
-        # ---------------------------------------------------------------
         embed = discord.Embed(
             title=titulo,
             description=f"*{subtitulo}* · {len(ctas)} resultado(s)",
@@ -1457,7 +1391,6 @@ class CtasCog(commands.Cog):
             paid = cta.get("paid", False)
             cta_id = cta.get("id", "?")
 
-            # Estado visual
             badges = []
             if status_txt == "scheduled":
                 badges.append("🕐 programada" if not paid else "💳 sin marcar")

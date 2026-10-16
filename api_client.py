@@ -136,33 +136,6 @@ class APIClient:
         return await cls._get("/oro")
 
     @classmethod
-    async def register_character(
-        cls,
-        character_name: str,
-        discord_user_id: str,
-        birthdate: str | None = None,
-        discord_username: str | None = None,
-        performed_by_discord_id: str | None = None,
-    ) -> tuple[dict, int]:
-        """
-        POST /api/bot/register-character
-        Registra un personaje. Si `performed_by_discord_id` viene, se guarda en logs
-        para auditoría (caso de un oficial registrando a otro).
-        """
-        payload: dict = {
-            "character_name": character_name,
-            "discord_user_id": discord_user_id,
-        }
-        if birthdate:
-            payload["birthdate"] = birthdate
-        if discord_username:
-            payload["discord_username"] = discord_username
-        if performed_by_discord_id:
-            payload["performed_by_discord_id"] = performed_by_discord_id
-
-        return await cls._request("POST", "/register-character", payload)
-    
-    @classmethod
     async def sync_registration(cls, discord_user_id: str) -> tuple[dict, int]:
         """
         POST /api/bot/sync-registration
@@ -170,7 +143,7 @@ class APIClient:
         """
         payload = {"discord_user_id": discord_user_id}
         return await cls._request("POST", "/sync-registration", payload)
-    
+
     @classmethod
     async def get_registered_members(cls) -> tuple[dict, int]:
         """
@@ -195,7 +168,13 @@ class APIClient:
         discord_username: str | None = None,
         performed_by_discord_id: str | None = None,
     ) -> tuple[dict, int]:
-        payload = {"discord_user_id": discord_user_id}
+        """
+        POST /api/bot/register-character
+
+        Acepta `character_id` (consulta directa, sin ambigüedad) O
+        `character_name` (búsqueda por nombre). Al menos uno debe venir.
+        """
+        payload: dict = {"discord_user_id": discord_user_id}
         if character_id:
             payload["character_id"] = character_id
         elif character_name:
@@ -207,7 +186,7 @@ class APIClient:
         if performed_by_discord_id:
             payload["performed_by_discord_id"] = performed_by_discord_id
         return await cls._request("POST", "/register-character", payload)
-    
+
     # ============================ Banco personal ============================
 
     @classmethod
@@ -321,7 +300,7 @@ class APIClient:
         if image_url:
             payload["image_url"] = image_url
         return await cls._request("POST", "/guild-transactions", payload)
-    
+
     # ============================ Actividades ============================
 
     @classmethod
@@ -347,13 +326,43 @@ class APIClient:
     async def get_activity(cls, activity_id: int) -> tuple[dict, int]:
         """GET /api/bot/activities/{id} — detalle con participantes."""
         return await cls._get(f"/activities/{int(activity_id)}")
-    
+
     # ============================ Composiciones ============================
 
     @classmethod
     async def get_compositions(cls) -> tuple[dict, int]:
         """GET /api/bot/compositions — lista composiciones activas."""
         return await cls._get("/compositions")
+
+    @classmethod
+    async def create_composition(
+        cls,
+        name: str,
+        description: str | None,
+        weapons: list[dict],
+    ) -> tuple[dict, int]:
+        """
+        POST /api/bot/compositions
+        `weapons` es una lista de {name: str, icon: str | None}
+        """
+        payload = {
+            "name": name[:120],
+            "weapons": [
+                {
+                    "name": w["name"][:120],
+                    "icon": (w.get("icon") or None),
+                }
+                for w in weapons
+            ],
+        }
+        if description:
+            payload["description"] = description[:500]
+        return await cls._request("POST", "/compositions", payload)
+
+    @classmethod
+    async def delete_composition(cls, composition_id: int) -> tuple[dict, int]:
+        """DELETE /api/bot/compositions/{id} — soft delete (active=false)."""
+        return await cls._request("DELETE", f"/compositions/{int(composition_id)}")
 
     # ============================ CTAs ============================
 
@@ -414,38 +423,6 @@ class APIClient:
     async def mark_reminder_sent(cls, cta_id: int) -> tuple[dict, int]:
         """POST /api/bot/ctas/{id}/reminder-sent"""
         return await cls._request("POST", f"/ctas/{int(cta_id)}/reminder-sent")
-    
-    @classmethod
-    async def create_composition(
-        cls,
-        name: str,
-        description: str | None,
-        weapons: list[dict],
-    ) -> tuple[dict, int]:
-        """
-        POST /api/bot/compositions
-        `weapons` es una lista de {name: str, icon: str | None}
-        """
-        payload = {
-            "name": name[:120],
-            "weapons": [
-                {
-                    "name": w["name"][:120],
-                    "icon": (w.get("icon") or None),
-                }
-                for w in weapons
-            ],
-        }
-        if description:
-            payload["description"] = description[:500]
-        return await cls._request("POST", "/compositions", payload)
-
-    @classmethod
-    async def delete_composition(cls, composition_id: int) -> tuple[dict, int]:
-        """DELETE /api/bot/compositions/{id} — soft delete (active=false)."""
-        return await cls._request("DELETE", f"/compositions/{int(composition_id)}")
-    
-    # ============================ Listado de CTAs ============================
 
     @classmethod
     async def get_ctas(

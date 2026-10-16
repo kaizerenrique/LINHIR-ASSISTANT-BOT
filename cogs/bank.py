@@ -14,6 +14,81 @@ logger = logging.getLogger(__name__)
 
 
 # ===================================================================== #
+#                     Modal de rechazo (motivo obligatorio)             #
+# ===================================================================== #
+
+class RejectReasonModal(discord.ui.Modal, title="Motivo del rechazo"):
+    reason: discord.ui.TextInput = discord.ui.TextInput(
+        label="Motivo",
+        placeholder="Ej: Datos bancarios incorrectos",
+        min_length=3,
+        max_length=255,
+        required=True,
+        style=discord.TextStyle.paragraph,
+    )
+
+    def __init__(self, view: "WithdrawalActionView"):
+        super().__init__()
+        self.parent_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            result, status = await APIClient.reject_withdrawal(
+                self.parent_view.request_id,
+                reviewer_discord_id=str(interaction.user.id),
+                reviewer_name=interaction.user.display_name,
+                reason=str(self.reason),
+            )
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+
+        if status != 200 or not result.get("success"):
+            await interaction.followup.send(
+                f"❌ {result.get('reason', 'No se pudo rechazar la solicitud.')}",
+                ephemeral=True,
+            )
+            return
+
+        # Marcar la vista como procesada
+        self.parent_view.responded = True
+        self.parent_view._disable_all()
+
+        # Editar el mensaje original (guardado por el comando `/banco pendientes`)
+        if self.parent_view.message:
+            try:
+                embed = (
+                    self.parent_view.message.embeds[0]
+                    if self.parent_view.message.embeds
+                    else None
+                )
+                if embed:
+                    embed.color = 0xFF5252
+                    embed.set_footer(
+                        text=f"❌ Rechazado por {interaction.user.display_name}"
+                    )
+                await self.parent_view.message.edit(
+                    embed=embed, view=self.parent_view
+                )
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "No se pudo editar el mensaje original tras rechazo: %s", exc
+                )
+
+        await interaction.followup.send(
+            f"✅ Solicitud #{self.parent_view.request_id} rechazada.",
+            ephemeral=True,
+        )
+
+        logger.info(
+            "Retiro #%s rechazado por %s (motivo=%s)",
+            self.parent_view.request_id, interaction.user, self.reason,
+        )
+
+
+# ===================================================================== #
 #                  Vista con botones Aprobar / Rechazar                 #
 # ===================================================================== #
 
@@ -25,6 +100,10 @@ class WithdrawalActionView(discord.ui.View):
         self.request_id = request_id
         self.author_id = author_id  # quién ejecutó /banco pendientes
         self.responded = False
+        # Referencia al mensaje que contiene esta vista. Se asigna externamente
+        # después de enviarlo (`view.message = msg`) para poder editarlo desde
+        # el modal de rechazo (que no tiene acceso a `interaction.message`).
+        self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Solo oficiales pueden interactuar (re-validamos por si acaso)
@@ -62,14 +141,24 @@ class WithdrawalActionView(discord.ui.View):
             )
             return
 
-        # Editar el mensaje original: marcar como aprobado
+        # Marcar como procesada
         self.responded = True
         self._disable_all()
-        embed = interaction.message.embeds[0] if interaction.message.embeds else None
-        if embed:
-            embed.color = 0x5CCB45
-            embed.set_footer(text=f"✅ Aprobado por {interaction.user.display_name}")
-        await interaction.message.edit(embed=embed, view=self)
+
+        # Editar el mensaje original
+        if self.message:
+            try:
+                embed = self.message.embeds[0] if self.message.embeds else None
+                if embed:
+                    embed.color = 0x5CCB45
+                    embed.set_footer(
+                        text=f"✅ Aprobado por {interaction.user.display_name}"
+                    )
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "No se pudo editar el mensaje original tras aprobación: %s", exc
+                )
 
         logger.info(
             "Retiro #%s aprobado por %s", self.request_id, interaction.user
@@ -86,83 +175,9 @@ class WithdrawalActionView(discord.ui.View):
         # Abrir modal para pedir el motivo
         await interaction.response.send_modal(RejectReasonModal(self))
 
-
-# ===================================================================== #
-#                     Modal de rechazo (motivo obligatorio)             #
-# ===================================================================== #
-
-class RejectReasonModal(discord.ui.Modal, title="Motivo del rechazo"):
-    reason: discord.ui.TextInput = discord.ui.TextInput(
-        label="Motivo",
-        placeholder="Ej: Datos bancarios incorrectos",
-        min_length=3,
-        max_length=255,
-        required=True,
-        style=discord.TextStyle.paragraph,
-    )
-
-    def __init__(self, view: WithdrawalActionView):
-        super().__init__()
-        self.parent_view = view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-
-        try:
-            result, status = await APIClient.reject_withdrawal(
-                self.parent_view.request_id,
-                reviewer_discord_id=str(interaction.user.id),
-                reviewer_name=interaction.user.display_name,
-                reason=str(self.reason),
-            )
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo rechazar la solicitud.')}",
-                ephemeral=True,
-            )
-            return
-
-        # Editar el mensaje original
-        self.parent_view.responded = True
-        self.parent_view._disable_all()
-
-        try:
-            original = await interaction.channel.fetch_message(interaction.message.id)
-            embed = original.embeds[0] if original.embeds else None
-        except (discord.NotFound, discord.HTTPException):
-            embed = None
-
-        if embed:
-            embed.color = 0xFF5252
-            embed.set_footer(text=f"❌ Rechazado por {interaction.user.display_name}")
-
-        try:
-            # Buscar el mensaje original que contiene la View
-            async for msg in interaction.channel.history(limit=20):
-                if msg.author == interaction.client.user and msg.components:
-                    if any(
-                        getattr(c, "custom_id", "").startswith("WithdrawalActionView")
-                        for row in msg.components
-                        for c in row.children
-                    ):
-                        continue
-            # Enfoque simple: editar el mensaje de la interacción del modal (no aplica)
-            # Usamos followup para avisar y editamos el mensaje si podemos
-            await interaction.followup.send(
-                f"✅ Solicitud #{self.parent_view.request_id} rechazada.",
-                ephemeral=True,
-            )
-        except Exception as exc:
-            logger.exception("Error enviando confirmación de rechazo: %s", exc)
-
-        logger.info(
-            "Retiro #%s rechazado por %s (motivo=%s)",
-            self.parent_view.request_id, interaction.user, self.reason,
-        )
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
 
 
 # ===================================================================== #
@@ -334,7 +349,7 @@ class BankCog(commands.Cog):
                 "rejected": "❌ Rechazado",
             }
             label = status_map.get(req.get("status"), req.get("status", "?"))
-            fecha = (req.get("created_at") or "")[:10]  # YYYY-MM-DD
+            fecha = (req.get("created_at") or "")[:10]
             monto = format_number(req.get("amount", 0))
 
             line = f"`#{req['id']}` · {monto} · {label} · `{fecha}`"
@@ -414,7 +429,10 @@ class BankCog(commands.Cog):
                 request_id=req_id,
                 author_id=interaction.user.id,
             )
-            await interaction.channel.send(embed=embed, view=view)
+            # Enviar y guardar la referencia al mensaje para poder editarlo
+            # desde el modal de rechazo (que no tiene `interaction.message`).
+            msg = await interaction.channel.send(embed=embed, view=view)
+            view.message = msg
 
     # ------------------- /banco gremio_saldo -------------------
 

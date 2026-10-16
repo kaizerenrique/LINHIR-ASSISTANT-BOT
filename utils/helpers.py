@@ -1,6 +1,17 @@
 """Utilidades reutilizables para formateo y cálculos auxiliares."""
 
-from datetime import datetime, timedelta, timezone
+import re
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
+
+import discord
+
+from config import Config
+
+
+# ===================================================================== #
+#                          Ventanas de recursos                          #
+# ===================================================================== #
 
 # Zonas horarias de Albion Online (UTC): ventanas de recursos cada 6h.
 _RESOURCE_WINDOWS_UTC = (0, 6, 12, 18)
@@ -29,6 +40,21 @@ def next_resource_window() -> str:
     return f"`{next_hour:02d}:00 UTC` (en {hours}h {minutes}m)"
 
 
+# ===================================================================== #
+#                       Formateo de números y fechas                     #
+# ===================================================================== #
+
+def format_number(n: int | float, decimals: int = 0) -> str:
+    """1234567 → '1.234.567' (formato español)."""
+    return f"{n:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def extract_time(datetime_str: str) -> str:
+    """'2026-10-09 12:00:00' → '12:00:00'."""
+    parts = datetime_str.split(" ")
+    return parts[-1] if len(parts) > 1 else datetime_str
+
+
 def relative_time(ts_str: str) -> str:
     """
     Convierte 'Y-m-d H:i:s' (Laravel, sin TZ → asumimos UTC) en
@@ -54,18 +80,9 @@ def relative_time(ts_str: str) -> str:
     return f"hace {seconds // 86400}d"
 
 
-def format_number(n: int | float, decimals: int = 0) -> str:
-    """1234567 → '1.234.567' (formato español)."""
-    return f"{n:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def extract_time(datetime_str: str) -> str:
-    """'2026-10-09 12:00:00' → '12:00:00'."""
-    parts = datetime_str.split(" ")
-    return parts[-1] if len(parts) > 1 else datetime_str
-
-import re
-from datetime import date
+# ===================================================================== #
+#                            Fecha de nacimiento                         #
+# ===================================================================== #
 
 # Aceptamos: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
 _BIRTHDATE_PATTERNS = (
@@ -124,31 +141,10 @@ def parse_birthdate(raw: str) -> tuple[str | None, str | None]:
 
     return d.isoformat(), None
 
-import discord
-from config import Config
 
-
-async def is_officer(interaction: discord.Interaction) -> bool:
-    """
-    Verifica si el usuario que ejecuta el comando tiene permisos de oficial.
-
-    - Tiene permiso `administrator` nativo de Discord → true
-    - Tiene al menos uno de los roles listados en OFFICER_ROLE_IDS → true
-    - En caso contrario → false
-    """
-    if not interaction.guild:
-        return False
-
-    if interaction.user.guild_permissions.administrator:
-        return True
-
-    if not Config.OFFICER_ROLE_IDS:
-        return False
-
-    member_role_ids = {r.id for r in interaction.user.roles}
-    return bool(member_role_ids & set(Config.OFFICER_ROLE_IDS))
-
-from datetime import datetime, timezone
+# ===================================================================== #
+#                          Fecha + hora (UTC)                            #
+# ===================================================================== #
 
 # Formatos aceptados para fecha+hora (siempre interpretados como UTC)
 _DATETIME_FORMATS = (
@@ -183,12 +179,71 @@ def parse_datetime(raw: str) -> tuple[str | None, str | None]:
         "(ej. `25/09/2026 20:30`) o `YYYY-MM-DD HH:MM`."
     )
 
-import re
-import unicodedata
 
+# ===================================================================== #
+#                              Permisos                                  #
+# ===================================================================== #
+
+async def is_officer(interaction: discord.Interaction) -> bool:
+    """
+    Verifica si el usuario que ejecuta el comando tiene permisos de oficial.
+
+    - Tiene permiso `administrator` nativo de Discord → true
+    - Tiene al menos uno de los roles listados en OFFICER_ROLE_IDS → true
+    - En caso contrario → false
+    """
+    if not interaction.guild:
+        return False
+
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    if not Config.OFFICER_ROLE_IDS:
+        return False
+
+    member_role_ids = {r.id for r in interaction.user.roles}
+    return bool(member_role_ids & set(Config.OFFICER_ROLE_IDS))
+
+
+# ===================================================================== #
+#                          Sanitización de emojis                        #
+# ===================================================================== #
+
+# Rangos Unicode que aceptamos como emoji.
+# Nota: no es exhaustivo, es un filtro defensivo para descartar texto plano.
+_EMOJI_RANGES = (
+    (0x1F1E6, 0x1F1FF),  # Banderas (regional indicators)
+    (0x1F300, 0x1F5FF),  # Símbolos y pictogramas
+    (0x1F600, 0x1F64F),  # Emoticons
+    (0x1F680, 0x1F6FF),  # Transporte y mapas
+    (0x1F700, 0x1F77F),
+    (0x1F780, 0x1F7FF),
+    (0x1F800, 0x1F8FF),
+    (0x1F900, 0x1F9FF),
+    (0x1FA00, 0x1FAFF),
+    (0x1F3FB, 0x1F3FF),  # Tonos de piel
+    (0x2600,  0x26FF),   # Símbolos misceláneos
+    (0x2700,  0x27BF),   # Dingbats
+    (0x2300,  0x23FF),   # Símbolos técnicos
+    (0x2B00,  0x2BFF),   # Símbolos y flechas
+    (0x2190,  0x21FF),   # Flechas
+    (0x2900,  0x297F),   # Flechas suplementarias
+    (0x3000,  0x303F),   # Símbolos CJK
+    (0x3200,  0x32FF),   # CJK encerrados
+    (0xFE00,  0xFE0F),   # Selectores de variación
+    (0x1F000, 0x1F02F),  # Mahjong y fichas
+    (0x1F0A0, 0x1F0FF),  # Cartas de poker
+)
 
 # Regex para custom emoji markup: <:name:id> o <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"^<(a?):(\w+):(\d+)>$")
+
+
+def _is_emoji_codepoint(cp: int) -> bool:
+    """Verifica si un codepoint pertenece a un rango emoji permitido."""
+    if cp == 0x200D:  # ZWJ (Zero Width Joiner) — permitido dentro de secuencias
+        return True
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES)
 
 
 def sanitize_emoji(raw: str | None) -> str | None:
