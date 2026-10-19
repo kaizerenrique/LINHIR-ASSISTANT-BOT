@@ -1,6 +1,27 @@
-"""Cog de CTAs: creación, inscripción, ausencias, pagos y recordatorios."""
+"""Cog de CTAs: creación, inscripción, ausencias, pagos y recordatorios.
+
+Arquitectura de los botones:
+  - Los mensajes de CTA contienen botones con custom_id dinámicos:
+      linhir:cta:join:{id}
+      linhir:cta:absent:{id}
+      linhir:cta:refresh:{id}
+
+  - Como los custom_id varían por CTA, NO se pueden registrar con
+    `bot.add_view()` (esa API requiere custom_id únicos y constantes).
+
+  - En su lugar, se usa un listener global `on_interaction` que captura
+    cualquier botón cuyo custom_id coincida con el patrón.
+
+  - Cada handler hace `interaction.response.defer()` ANTES de llamar a
+    la API de Laravel, para evitar el timeout de 3 s de Discord.
+
+  - El regex acepta tanto `linhir:cta:*` (lo que publica la web y este
+    cog) como `cta:*` (formato usado por versiones anteriores del bot),
+    garantizando retrocompatibilidad con mensajes ya publicados.
+"""
 
 import logging
+import re
 from datetime import datetime, timezone
 
 import discord
@@ -15,7 +36,19 @@ logger = logging.getLogger(__name__)
 
 
 # ===================================================================== #
-#                       Autocompletado de composiciones                 #
+#              Regex de custom_ids (web + bot, retrocompatible)         #
+# ===================================================================== #
+
+CTA_JOIN_RE    = re.compile(r"^(?:linhir:)?cta:join:(\d+)$")
+CTA_ABSENT_RE  = re.compile(r"^(?:linhir:)?cta:absent:(\d+)$")
+CTA_REFRESH_RE = re.compile(r"^(?:linhir:)?cta:refresh:(\d+)$")
+
+# Límite duro de Discord para field.value en un embed
+_FIELD_VALUE_MAX = 1024
+
+
+# ===================================================================== #
+#                     Autocompletado de composiciones                   #
 # ===================================================================== #
 
 async def composition_autocomplete(
@@ -183,6 +216,8 @@ class WeaponSelectView(discord.ui.View):
         self.all_weapons = weapons
         self.channel_id = channel_id
         self.message_id = message_id
+        # Se asigna externamente desde el handler: `view.bot = interaction.client`
+        self.bot = None
 
         chunks = [
             weapons[i:i + self.MAX_WEAPONS_PER_SELECT]
@@ -230,36 +265,55 @@ class WeaponSelectView(discord.ui.View):
 
     async def refresh_public_message(self):
         """Recarga la CTA y edita el mensaje público original."""
+        if not self.message_id or not self.bot:
+            return
+
         try:
             result, status = await APIClient.get_cta(self.cta_id)
             if status != 200 or not result.get("success"):
                 return
 
-            channel = self.bot.get_channel(self.channel_id) if hasattr(self, "bot") else None
-            if channel is None or not self.message_id:
+            channel = self.bot.get_channel(self.channel_id)
+            if channel is None:
                 return
 
             msg = await channel.fetch_message(self.message_id)
             embed = build_cta_embed(result["cta"])
-            await msg.edit(embed=embed)
+            new_view = CtaAnnouncementView(cta_id=self.cta_id)
+            await msg.edit(embed=embed, view=new_view)
         except Exception as exc:
-            logger.warning("No se pudo refrescar el mensaje público de la CTA: %s", exc)
+            logger.warning(
+                "No se pudo refrescar el mensaje público de la CTA #%s: %s",
+                self.cta_id, exc,
+            )
 
 
 # ===================================================================== #
-#                 Vista pública: Unirse / Ausente (persistente)          #
+#             Vista pública: Unirse / Ausente / Refresh                 #
 # ===================================================================== #
 
 class CtaAnnouncementView(discord.ui.View):
-    """Vista pública del mensaje de CTA."""
+    """
+    Vista pública del mensaje de CTA.
+
+    IMPORTANTE: esta vista es SOLO VISUAL. Los custom_id de los botones
+    son dinámicos (contienen el ID de la CTA), por lo que no se puede
+    registrar con `bot.add_view()`. La lógica real está en el listener
+    `on_interaction` de `CtasCog`.
+
+    Los callbacks definidos aquí NUNCA se ejecutan (la vista no está
+    registrada con add_view). Se definen únicamente para que los
+    botones se rendericen con el estilo, emoji y custom_id correctos.
+    """
 
     def __init__(self, cta_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
 
-        self.join_btn.custom_id = f"cta:join:{cta_id}"
-        self.absent_btn.custom_id = f"cta:absent:{cta_id}"
-        self.refresh_btn.custom_id = f"cta:refresh:{cta_id}"
+        # custom_ids con formato "linhir:cta:*" (compatible con la web)
+        self.join_btn.custom_id    = f"linhir:cta:join:{cta_id}"
+        self.absent_btn.custom_id  = f"linhir:cta:absent:{cta_id}"
+        self.refresh_btn.custom_id = f"linhir:cta:refresh:{cta_id}"
 
     @discord.ui.button(
         label="Unirse",
@@ -268,48 +322,8 @@ class CtaAnnouncementView(discord.ui.View):
         row=0,
     )
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            result, status = await APIClient.get_cta(self.cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.response.send_message(f"🔐 {exc}", ephemeral=True)
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.response.send_message(
-                "❌ No se pudo cargar la CTA.", ephemeral=True
-            )
-            return
-
-        cta = result["cta"]
-        composition = cta.get("composition") or {}
-        weapons = composition.get("weapons") or []
-
-        occupancy = {}
-        for p in cta.get("participants") or []:
-            if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
-                occupancy[str(p["composition_weapon_id"])] = p["user_name"]
-
-        if not weapons:
-            await interaction.response.send_message(
-                "⚠️ Esta CTA no tiene composición con armas.", ephemeral=True
-            )
-            return
-
-        view = WeaponSelectView(
-            cta_id=self.cta_id,
-            weapons=weapons,
-            occupancy=occupancy,
-            author_id=interaction.user.id,
-            channel_id=interaction.channel_id,
-            message_id=interaction.message.id,
-        )
-        view.bot = interaction.client
-
-        await interaction.response.send_message(
-            "Selecciona el arma con la que participarás:",
-            view=view,
-            ephemeral=True,
-        )
+        # Callback no ejecutado: la lógica está en on_interaction
+        pass
 
     @discord.ui.button(
         label="Ausente",
@@ -318,29 +332,8 @@ class CtaAnnouncementView(discord.ui.View):
         row=0,
     )
     async def absent_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            result, status = await APIClient.cta_absent(
-                self.cta_id, str(interaction.user.id)
-            )
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo registrar tu ausencia.')}",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.followup.send(
-            "🚫 Marcado como ausente. Se ha liberado tu arma (si tenías una).",
-            ephemeral=True,
-        )
-
-        await self._refresh_public(interaction)
+        # Callback no ejecutado: la lógica está en on_interaction
+        pass
 
     @discord.ui.button(
         label="🔄",
@@ -348,28 +341,68 @@ class CtaAnnouncementView(discord.ui.View):
         row=1,
     )
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        await self._refresh_public(interaction)
-
-    async def _refresh_public(self, interaction: discord.Interaction):
-        try:
-            result, status = await APIClient.get_cta(self.cta_id)
-            if status == 200 and result.get("success"):
-                embed = build_cta_embed(result["cta"])
-                await interaction.message.edit(embed=embed, view=self)
-        except Exception as exc:
-            logger.warning("No se pudo refrescar CTA #%s: %s", self.cta_id, exc)
+        # Callback no ejecutado: la lógica está en on_interaction
+        pass
 
 
 # ===================================================================== #
 #                        Constructor de embed                           #
 # ===================================================================== #
 
+def _build_weapons_field(
+    weapons: list[dict],
+    occupancy: dict[int, str],
+) -> tuple[str, int]:
+    """
+    Construye el texto del field "Armas y asignación" respetando el
+    límite de 1024 caracteres de Discord.
+
+    Retorna: (texto, cantidad_ocupadas)
+    """
+    if not weapons:
+        return ("*Sin armas definidas*", 0)
+
+    lineas: list[str] = []
+    for w in weapons:
+        icon = sanitize_emoji(w.get("weapon_icon")) or "•"
+        name = w.get("weapon_name", "—")
+        taken = occupancy.get(w["id"])
+        if taken:
+            lineas.append(f"{icon} **{name}** — 🔒 {taken}")
+        else:
+            lineas.append(f"{icon} {name} — ⚪ *libre*")
+
+    # Acumular líneas hasta acercarse a 1024 con margen para el sufijo
+    suffix_margin = 60
+    max_len = _FIELD_VALUE_MAX - suffix_margin
+    out: list[str] = []
+    total_len = 0
+    shown = 0
+
+    for linea in lineas:
+        extra = (1 if shown > 0 else 0) + len(linea)
+        if total_len + extra > max_len:
+            break
+        out.append(linea)
+        total_len += extra
+        shown += 1
+
+    texto = "\n".join(out)
+    if shown < len(lineas):
+        texto += f"\n… y **{len(lineas) - shown}** más (ver en la web)"
+
+    # Red de seguridad final
+    if len(texto) > _FIELD_VALUE_MAX:
+        texto = texto[: _FIELD_VALUE_MAX - 1] + "…"
+
+    return (texto, len(occupancy))
+
+
 def build_cta_embed(cta: dict) -> discord.Embed:
     """Construye el embed público de una CTA con ocupación de armas."""
     cta_id = cta.get("id", "?")
-    title = cta.get("title", "—")
-    location = cta.get("location", "—")
+    title = (cta.get("title") or "—")[:250]
+    location = cta.get("location") or "—"
     status = cta.get("status", "scheduled")
     paid = cta.get("paid", False)
     composition = cta.get("composition") or {}
@@ -385,10 +418,14 @@ def build_cta_embed(cta: dict) -> discord.Embed:
 
     embed = discord.Embed(
         title=f"⚔️ {title}",
-        description=f"📍 **{location}**\n🎭 Composición: **{composition.get('name', '—')}**",
+        description=(
+            f"📍 **{location}**\n"
+            f"🎭 Composición: **{composition.get('name', '—')}**"
+        ),
         color=color,
     )
 
+    # Fechas
     start_iso = cta.get("start_time")
     end_iso = cta.get("end_time")
     if start_iso:
@@ -411,6 +448,7 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         except (ValueError, TypeError):
             embed.add_field(name="🏁 Fin", value=end_iso, inline=True)
 
+    # Estado
     if status == "cancelled":
         embed.add_field(name="Estado", value="❌ **Cancelada**", inline=True)
     elif status == "completed":
@@ -421,31 +459,21 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     elif paid:
         embed.add_field(name="Estado", value="💵 **Pagada**", inline=True)
 
-    occupancy: dict[int, str | None] = {}
+    # Ocupación por arma
+    occupancy: dict[int, str] = {}
     for p in participants:
         if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
             occupancy[p["composition_weapon_id"]] = p["user_name"]
 
     if weapons:
-        lines = []
-        for w in weapons[:20]:
-            taken = occupancy.get(w["id"])
-            icon = sanitize_emoji(w.get("weapon_icon")) or "•"
-            name = w["weapon_name"]
-            if taken:
-                lines.append(f"{icon} **{name}** — {taken}")
-            else:
-                lines.append(f"{icon} {name} — *libre*")
-
-        if len(weapons) > 20:
-            lines.append(f"… y {len(weapons) - 20} más")
-
+        armas_text, ocupadas = _build_weapons_field(weapons, occupancy)
         embed.add_field(
-            name=f"🎭 Armas ({len(occupancy)}/{len(weapons)} ocupadas)",
-            value="\n".join(lines)[:1024],
+            name=f"🎭 Armas ({ocupadas}/{len(weapons)} ocupadas)",
+            value=armas_text,
             inline=False,
         )
 
+    # Confirmados / Ausentes
     confirmed = [p for p in participants if p.get("status") == "confirmed"]
     absent    = [p for p in participants if p.get("status") == "absent"]
 
@@ -460,11 +488,19 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         )
 
     if absent:
+        names = ", ".join(p["user_name"] for p in absent[:10])
+        if len(absent) > 10:
+            names += f" (+{len(absent) - 10})"
         embed.add_field(
             name=f"🚫 Ausentes ({len(absent)})",
-            value=", ".join(p["user_name"] for p in absent[:10])[:1024],
+            value=names[:1024],
             inline=False,
         )
+
+    # Imagen (si existe)
+    image_url = cta.get("image_url")
+    if image_url:
+        embed.set_image(url=image_url)
 
     embed.set_footer(text=f"CTA #{cta_id} · {Config.GUILD_NAME}")
     return embed
@@ -485,14 +521,19 @@ class CtasCog(commands.Cog):
     # ================================================================== #
 
     async def cog_load(self):
-        await self._register_persistent_views()
+        await self._verify_cta_publications()
         self.reminder_loop.start()
 
     async def cog_unload(self):
         self.reminder_loop.cancel()
 
-    async def _register_persistent_views(self):
-        """Re-registra las vistas de todas las CTAs activas (sobrevive reinicios)."""
+    async def _verify_cta_publications(self):
+        """
+        Verifica cuántas CTAs activas tienen IDs de Discord guardados.
+
+        NO registra vistas persistentes: los botones se manejan con
+        `on_interaction`. Solo hace un log de diagnóstico.
+        """
         try:
             result, status = await APIClient.get_active_ctas()
         except (AuthenticationError, AuthorizationError):
@@ -502,23 +543,182 @@ class CtasCog(commands.Cog):
             return
 
         ctas = result.get("ctas", [])
-        registered = 0
-        for cta in ctas:
-            msg_id = cta.get("discord_message_id")
-            ch_id = cta.get("discord_channel_id")
-            if not (msg_id and ch_id):
-                continue
-            try:
-                view = CtaAnnouncementView(cta_id=int(cta["id"]))
-                self.bot.add_view(view, message_id=int(msg_id))
-                registered += 1
-            except Exception as exc:
-                logger.warning(
-                    "No se pudo registrar vista persistente para CTA #%s: %s",
-                    cta.get("id"), exc,
-                )
+        with_ids = sum(
+            1 for c in ctas
+            if c.get("discord_message_id") and c.get("discord_channel_id")
+        )
+        logger.info(
+            "CTAs activas: %d · con IDs de Discord: %d/%d "
+            "(los botones se manejan con on_interaction)",
+            len(ctas), with_ids, len(ctas),
+        )
 
-        logger.info("Vistas persistentes de CTAs registradas: %d/%d", registered, len(ctas))
+    # ================================================================== #
+    #                 LISTENER GLOBAL: BOTONES DE CTA                     #
+    # ================================================================== #
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        """
+        Captura TODOS los botones con custom_id de CTA (web + bot).
+
+        Patrón aceptado:
+          linhir:cta:join:{id}     (formato actual, web y bot)
+          linhir:cta:absent:{id}
+          linhir:cta:refresh:{id}
+          cta:join:{id}            (formato legacy, retrocompatible)
+          cta:absent:{id}
+          cta:refresh:{id}
+        """
+        if interaction.type != discord.InteractionType.component:
+            return
+
+        custom_id = (
+            interaction.data.get("custom_id", "")
+            if interaction.data else ""
+        )
+
+        logger.info(
+            "CTA interaction: custom_id=%r user=%s",
+            custom_id, interaction.user,
+        )
+
+        m = CTA_JOIN_RE.match(custom_id)
+        if m:
+            await self._handle_join_btn(interaction, int(m.group(1)))
+            return
+
+        m = CTA_ABSENT_RE.match(custom_id)
+        if m:
+            await self._handle_absent_btn(interaction, int(m.group(1)))
+            return
+
+        m = CTA_REFRESH_RE.match(custom_id)
+        if m:
+            await self._handle_refresh_btn(interaction, int(m.group(1)))
+            return
+
+        logger.debug("CTA interaction ignorada (no match): %r", custom_id)
+
+    # ================================================================== #
+    #                    HANDLERS DE BOTONES                              #
+    # ================================================================== #
+
+    async def _handle_join_btn(self, interaction: discord.Interaction, cta_id: int):
+        """Handler del botón 'Unirse': defer inmediato → get_cta → selector."""
+        # 1. DEFER PRIMERO (antes de cualquier llamada a la API)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 2. Consultar CTA
+        try:
+            result, status = await APIClient.get_cta(cta_id)
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+        except Exception as exc:
+            logger.exception("join_btn: error get_cta %s", cta_id)
+            await interaction.followup.send(
+                f"❌ No se pudo consultar la CTA: {exc}", ephemeral=True
+            )
+            return
+
+        if status != 200 or not result.get("success"):
+            await interaction.followup.send(
+                "❌ No se pudo cargar la CTA.", ephemeral=True
+            )
+            return
+
+        cta = result["cta"]
+        if cta.get("status") != "scheduled":
+            await interaction.followup.send(
+                "❌ Esta CTA ya no está activa.", ephemeral=True
+            )
+            return
+
+        composition = cta.get("composition") or {}
+        weapons = composition.get("weapons") or []
+
+        occupancy: dict[str, str] = {}
+        for p in cta.get("participants") or []:
+            if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
+                occupancy[str(p["composition_weapon_id"])] = p["user_name"]
+
+        if not weapons:
+            await interaction.followup.send(
+                "⚠️ Esta CTA no tiene composición con armas.", ephemeral=True
+            )
+            return
+
+        # 3. Selector de arma efímero
+        view = WeaponSelectView(
+            cta_id=cta_id,
+            weapons=weapons,
+            occupancy=occupancy,
+            author_id=interaction.user.id,
+            channel_id=interaction.channel_id,
+            message_id=interaction.message.id if interaction.message else 0,
+        )
+        view.bot = interaction.client
+
+        await interaction.followup.send(
+            "Selecciona el arma con la que participarás:",
+            view=view,
+            ephemeral=True,
+        )
+
+    async def _handle_absent_btn(self, interaction: discord.Interaction, cta_id: int):
+        """Handler del botón 'Ausente': defer primero, luego API."""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            result, status = await APIClient.cta_absent(
+                cta_id, str(interaction.user.id)
+            )
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+            return
+        except Exception as exc:
+            logger.exception("absent_btn: error %s", cta_id)
+            await interaction.followup.send(f"❌ Error: {exc}", ephemeral=True)
+            return
+
+        if status != 200 or not result.get("success"):
+            await interaction.followup.send(
+                f"❌ {result.get('reason', 'No se pudo registrar tu ausencia.')}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "🚫 Marcado como ausente. Se ha liberado tu arma (si tenías una).",
+            ephemeral=True,
+        )
+
+        await self._refresh_public_cta_message(interaction, cta_id)
+
+    async def _handle_refresh_btn(self, interaction: discord.Interaction, cta_id: int):
+        """Handler del botón '🔄': defer primero, luego refrescar mensaje."""
+        await interaction.response.defer()
+        await self._refresh_public_cta_message(interaction, cta_id)
+
+    async def _refresh_public_cta_message(
+        self, interaction: discord.Interaction, cta_id: int
+    ):
+        """Recarga la CTA y edita el mensaje público original (si se puede)."""
+        if not interaction.message:
+            return
+
+        try:
+            result, status = await APIClient.get_cta(cta_id)
+            if status != 200 or not result.get("success"):
+                return
+
+            embed = build_cta_embed(result["cta"])
+            new_view = CtaAnnouncementView(cta_id=cta_id)
+
+            await interaction.message.edit(embed=embed, view=new_view)
+        except Exception as exc:
+            logger.warning("No se pudo refrescar CTA #%s: %s", cta_id, exc)
 
     # ================================================================== #
     #                     Tarea: recordatorios por DM                     #
@@ -782,13 +982,12 @@ class CtasCog(commands.Cog):
 
         cta_id = result["cta_id"]
 
-        # 4. Actualizar mensaje con embed real + vista persistente
+        # 4. Actualizar mensaje con embed real + vista visual
         try:
             cta_result, cta_status = await APIClient.get_cta(cta_id)
             if cta_status == 200 and cta_result.get("success"):
                 real_embed = build_cta_embed(cta_result["cta"])
                 real_view = CtaAnnouncementView(cta_id=cta_id)
-                self.bot.add_view(real_view, message_id=msg.id)
                 await msg.edit(embed=real_embed, view=real_view)
         except Exception as exc:
             logger.warning("No se pudo refrescar el mensaje con datos reales: %s", exc)
@@ -1054,7 +1253,7 @@ class CtasCog(commands.Cog):
             cta_id, interaction.user, event_status, notified, len(participants),
         )
 
-    # ------------------- /cta pagar (NUEVO) -------------------
+    # ------------------- /cta pagar -------------------
 
     @cta_group.command(
         name="pagar",
@@ -1105,7 +1304,6 @@ class CtasCog(commands.Cog):
 
         cta = result["cta"]
 
-        # Validaciones
         if cta.get("paid"):
             await interaction.followup.send(
                 f"⚠️ La CTA **#{cta_id}** ya fue pagada.", ephemeral=True
@@ -1119,7 +1317,7 @@ class CtasCog(commands.Cog):
             return
 
         # ------------------------------------------------------------------
-        # 2. Modo pro-gremio → directo, sin panel
+        # 2. Modo pro-gremio
         # ------------------------------------------------------------------
         if pro_gremio:
             payload = {
@@ -1164,7 +1362,7 @@ class CtasCog(commands.Cog):
             return
 
         # ------------------------------------------------------------------
-        # 3. Modo normal → precargar participantes y abrir panel
+        # 3. Modo normal → precargar participantes
         # ------------------------------------------------------------------
         try:
             members_data, members_status = await APIClient.get_registered_members()
