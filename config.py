@@ -16,52 +16,83 @@ def _int_env(name: str, default: int = 0) -> int:
 
 
 class Config:
-    # --- Discord ---
+    # =================================================================
+    #  DISCORD
+    # =================================================================
     DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
     DEV_GUILD_ID = _int_env("DEV_GUILD_ID") or None
 
-    # --- Web API ---
+    # =================================================================
+    #  WEB API
+    # =================================================================
     API_BASE_URL = os.getenv("API_BASE_URL", "https://linhir.online").rstrip("/")
     API_PREFIX = os.getenv("API_PREFIX", "/api/bot").rstrip("/")
     API_TIMEOUT = _int_env("API_TIMEOUT", 10)
     BOT_ACCESS_TOKEN = os.getenv("BOT_ACCESS_TOKEN", "").strip()
 
-    # --- Personalización ---
+    # =================================================================
+    #  PERSONALIZACIÓN
+    # =================================================================
     GUILD_NAME = os.getenv("GUILD_NAME", "Linhir")
     EMBED_COLOR = int(os.getenv("EMBED_COLOR", "0xC54B47"), 16)
     EMBED_ACCENT = int(os.getenv("EMBED_ACCENT", "0xD4B44A"), 16)
 
-    # --- Roles de Discord (para /register) ---
+    # =================================================================
+    #  ROLES DE DISCORD (para /register)
+    # =================================================================
     LINHIR_ROLE_ID = _int_env("LINHIR_ROLE_ID")
     PUBLICO_ROLE_ID = _int_env("PUBLICO_ROLE_ID")
+    HRL_ROLE_ID = _int_env("HRL_ROLE_ID")
     NICKNAME_PREFIX = os.getenv("NICKNAME_PREFIX", "[LH]")
 
-    # --- Roles de oficial (para comandos administrativos) ---
+    # =================================================================
+    #  AUDITORÍA
+    # =================================================================
+    AUDIT_CHANNEL_ID = _int_env("AUDIT_CHANNEL_ID")
+
+    # =================================================================
+    #  ROLES DE OFICIAL (para comandos administrativos)
+    # =================================================================
     OFFICER_ROLE_IDS = [
         int(x.strip())
         for x in os.getenv("OFFICER_ROLE_IDS", "").split(",")
         if x.strip() and x.strip().isdigit()
     ]
 
-    # --- Reportes automáticos ---
+    # =================================================================
+    #  REPORTES AUTOMÁTICOS
+    # =================================================================
     REPORT_CHANNEL_ID = _int_env("REPORT_CHANNEL_ID")
     REPORT_HOUR_UTC = os.getenv("REPORT_HOUR_UTC", "12:00")
 
-    # --- Recordatorios ---
+    # =================================================================
+    #  RECORDATORIOS
+    # =================================================================
     REMINDER_DM_DELAY = float(os.getenv("REMINDER_DM_DELAY", "1.2"))
 
-    # --- Canal de identificación (panel de registro) ---
+    # =================================================================
+    #  CANAL DE IDENTIFICACIÓN (panel de registro)
+    # =================================================================
     IDENTIFY_CHANNEL_ID = _int_env("IDENTIFY_CHANNEL_ID")
 
-    # --- Canal de anuncios de CTAs ---
+    # =================================================================
+    #  CANAL DE ANUNCIOS DE CTAs
+    # =================================================================
     CTA_ANNOUNCE_CHANNEL_ID = _int_env("CTA_ANNOUNCE_CHANNEL_ID")
 
-    # --- Poller de recordatorios (segundos entre ciclos) ---
+    # =================================================================
+    #  POLLER DE RECORDATORIOS (segundos entre ciclos)
+    # =================================================================
     CTA_REMINDER_POLL_SECONDS = _int_env("CTA_REMINDER_POLL_SECONDS", 60)
 
-    # --- Duración mínima de una CTA (minutos) ---
+    # =================================================================
+    #  DURACIÓN MÍNIMA DE UNA CTA (minutos)
+    # =================================================================
     CTA_MIN_DURATION_MIN = _int_env("CTA_MIN_DURATION_MIN", 15)
 
+    # =================================================================
+    #  HELPERS
+    # =================================================================
     @classmethod
     def report_hour_and_minute(cls) -> tuple[int, int]:
         """Parsea 'HH:MM' y devuelve (hora, minuto). Fallback a 12:00."""
@@ -107,6 +138,14 @@ class Config:
                 "PUBLICO_ROLE_ID no configurado en .env. "
                 "Copia el ID del rol @Publico desde Discord."
             )
-        if not cls.CTA_ANNOUNCE_CHANNEL_ID:
-            logger_name = "Config"
-            # No es fatal: solo bloquea /cta crear. Lo validamos en el comando.
+        if not cls.HRL_ROLE_ID:
+            raise ValueError(
+                "HRL_ROLE_ID no configurado en .env. "
+                "Copia el ID del rol @HRL desde Discord."
+            )
+        # AUDIT_CHANNEL_ID: solo warning, no bloquea el arranque
+        if not cls.AUDIT_CHANNEL_ID:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AUDIT_CHANNEL_ID no configurado. Los registros no se auditarán en Discord."
+            )
