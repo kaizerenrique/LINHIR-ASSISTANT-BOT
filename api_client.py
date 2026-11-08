@@ -449,3 +449,11 @@ class APIClient:
     async def get_pending_payment_ctas(cls) -> tuple[dict, int]:
         """GET /api/bot/ctas/pending-payment — CTAs pasadas sin pagar."""
         return await cls._get("/ctas/pending-payment")
+    
+    @classmethod
+    async def get_allied_guilds(cls) -> tuple[dict, int]:
+        """
+        GET /api/bot/allied-guilds
+        Catálogo de gremios aliados activos y configurados.
+        """
+        return await cls._get("/allied-guilds")

@@ -514,6 +514,147 @@ class ReportsCog(commands.Cog):
         )
         embed.set_footer(text="¿Deseas retirar el rol @Linhir?")
         return embed
+    
+    # ------------------------------------------------------------------ #
+    #                 /admin rebuild_roles (migración masiva)            #
+    # ------------------------------------------------------------------ #
+
+    admin_group = app_commands.Group(
+        name="admin",
+        description="Comandos administrativos de migración y mantenimiento",
+        default_permissions=discord.Permissions(administrator=True),
+    )
+
+    @admin_group.command(
+        name="rebuild_roles",
+        description="[Admin] Re-aplica roles y nickname a TODOS los vinculados según su estado en BD",
+    )
+    async def rebuild_roles(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if not await is_officer(interaction):
+            await interaction.followup.send("❌ Solo oficiales.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="⚠️ Confirmación de migración masiva",
+            description=(
+                "Se aplicará el **estado actual** de cada vínculo en la BD:\n\n"
+                "• **Miembros Linhir** → `[LH] Nombre` + `@Linhir` + `@Publico` + `@HRL`\n"
+                "• **Aliados** → `[TAG] Nombre` + `@HRL` + `@Publico` + `@[TAG]`\n"
+                "• **Públicos** → `Nombre` + `@Publico`\n\n"
+                "También se **removerán** roles obsoletos.\n\n"
+                "**Puede tardar varios minutos** (rate limit).\n\n¿Continuar?"
+            ),
+            color=Config.EMBED_ACCENT,
+        )
+
+        from cogs.reminders import ConfirmActionView
+        view = ConfirmActionView(interaction.user.id)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        await view.wait()
+
+        if view.confirmed is not True:
+            await interaction.edit_original_response(content="❌ Cancelada.", embed=None, view=None)
+            return
+
+        try:
+            data, status = await APIClient.get_registered_members()
+        except (AuthenticationError, AuthorizationError) as exc:
+            await interaction.edit_original_response(content=f"🔐 {exc}", embed=None, view=None)
+            return
+
+        if status != 200 or not data.get("success"):
+            await interaction.edit_original_response(
+                content="❌ No se pudo consultar el roster.", embed=None, view=None
+            )
+            return
+
+        identity_cog = self.bot.get_cog("IdentityCog")
+        if not identity_cog:
+            await interaction.edit_original_response(
+                content="❌ IdentityCog no cargado.", embed=None, view=None
+            )
+            return
+
+        processed: dict[str, dict] = {}
+        for p in data.get("all_linked", []):
+            uid = p.get("discord_user_id")
+            if not uid:
+                continue
+            current = processed.get(uid, {"decision": "public", "character": None, "allied_guild": None})
+            is_member = bool(p.get("miembro"))
+            allied    = p.get("allied_guild")
+
+            if is_member:
+                processed[uid] = {
+                    "decision": "member",
+                    "character": {"name": p["name"], "id": p.get("id_albion"), "guild_name": "Linhir"},
+                    "allied_guild": None,
+                }
+            elif allied and current["decision"] != "member":
+                processed[uid] = {
+                    "decision": "allied",
+                    "character": {"name": p["name"], "id": p.get("id_albion"), "guild_name": allied.get("guild_name")},
+                    "allied_guild": allied,
+                }
+            elif current["decision"] == "public":
+                processed[uid] = {
+                    "decision": "public",
+                    "character": {"name": p["name"], "id": p.get("id_albion"), "guild_name": None},
+                    "allied_guild": None,
+                }
+
+        total = len(processed)
+        await interaction.edit_original_response(content=f"⏳ Procesando **{total}** usuarios…", embed=None, view=None)
+
+        ok, errors, skipped = 0, 0, 0
+        error_details: list[str] = []
+
+        for i, (uid, info) in enumerate(processed.items(), 1):
+            try:
+                member = await interaction.guild.fetch_member(int(uid))
+            except (discord.NotFound, ValueError):
+                skipped += 1
+                continue
+            except discord.HTTPException as exc:
+                errors += 1
+                error_details.append(f"<@{uid}>: HTTP {exc.status}")
+                continue
+
+            try:
+                await identity_cog._dispatch_role_changes(
+                    member, info["decision"], info["character"],
+                    allied_guild=info["allied_guild"], previous_state=None,
+                )
+                ok += 1
+            except Exception as exc:
+                errors += 1
+                error_details.append(f"<@{uid}>: {type(exc).__name__}")
+                logger.exception("rebuild_roles: error con %s", uid)
+
+            if i % 10 == 0:
+                try:
+                    await interaction.edit_original_response(
+                        content=f"⏳ **{i}/{total}** (ok={ok}, errores={errors})"
+                    )
+                except discord.HTTPException:
+                    pass
+
+            import asyncio
+            await asyncio.sleep(0.5)
+
+        summary = discord.Embed(title="✅ Migración masiva completada", color=Config.EMBED_COLOR)
+        summary.add_field(name="Total", value=f"`{total}`", inline=True)
+        summary.add_field(name="✅ OK", value=f"`{ok}`", inline=True)
+        summary.add_field(name="❌ Errores", value=f"`{errors}`", inline=True)
+        summary.add_field(name="⏭️ Omitidos", value=f"`{skipped}`", inline=True)
+        if error_details:
+            summary.add_field(name="Errores",
+                value="\n".join(error_details[:10])[:1024], inline=False)
+
+        await interaction.edit_original_response(content=None, embed=summary)
+        logger.info("rebuild_roles: total=%d ok=%d errors=%d skipped=%d", total, ok, errors, skipped)
 
     # ------------------------------------------------------------------ #
     #                        Error handler del cog                        #
