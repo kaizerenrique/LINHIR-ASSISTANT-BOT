@@ -59,8 +59,15 @@ class RegistrationModal(discord.ui.Modal, title="Registro de personaje"):
             await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
             return
 
+        # --- MANEJO DE ERRORES ---
         if status != 200:
-            await interaction.followup.send("❌ Servidor no disponible.", ephemeral=True)
+            error_msg = "Servidor de Linhir no disponible."
+            if status == 422:
+                error_msg = result.get("error", "Datos inválidos. Revisa el nombre y la fecha de nacimiento.")
+            elif status == 500:
+                error_msg = "Error interno en el servidor (Laravel). Contacta a un administrador."
+            
+            await interaction.followup.send(f"❌ {error_msg}", ephemeral=True)
             return
 
         if not result.get("success") and result.get("ambiguous"):
@@ -112,8 +119,6 @@ class RegistrationModal(discord.ui.Modal, title="Registro de personaje"):
             allied_guild=allied_guild, previous_state=previous,
             actions=actions, performed_by=None,
         )
-
-        # NOTA: Ya NO se toca el panel. Permanece inmóvil en el canal.
 
 
 # ===================================================================== #

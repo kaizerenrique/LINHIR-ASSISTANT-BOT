@@ -23,10 +23,6 @@ class IdentityCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ================================================================= #
-    #                       /register start                              #
-    # ================================================================= #
-
     register_group = app_commands.Group(
         name="register",
         description="Registro y gestión de identidad en el gremio Linhir",
@@ -63,10 +59,6 @@ class IdentityCog(commands.Cog):
             interaction=interaction, target_member=member,
             personaje=personaje.strip(), birthdate_iso=birthdate_iso, performed_by=None,
         )
-
-    # ================================================================= #
-    #                       /register search                             #
-    # ================================================================= #
 
     @register_group.command(name="search", description="Busca tu personaje por nombre (con desambiguación)")
     @app_commands.describe(
@@ -119,10 +111,6 @@ class IdentityCog(commands.Cog):
             players=players, birthdate_iso=birthdate_iso, performed_by=None,
         )
 
-    # ================================================================= #
-    #                       /register manager                            #
-    # ================================================================= #
-
     @register_group.command(name="manager", description="Registra a otro miembro del gremio (Solo Oficiales)")
     @app_commands.describe(
         miembro="Usuario de Discord a registrar",
@@ -157,10 +145,6 @@ class IdentityCog(commands.Cog):
             personaje=personaje.strip(), birthdate_iso=birthdate_iso,
             performed_by=str(interaction.user.id),
         )
-
-    # ================================================================= #
-    #                       /register update                             #
-    # ================================================================= #
 
     @register_group.command(name="update", description="Sincroniza tus roles según tu estado actual en Albion")
     @app_commands.describe(miembro="[Opcional · Solo Oficiales] Sincronizar a otro miembro")
@@ -244,8 +228,15 @@ class IdentityCog(commands.Cog):
             await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
             return
 
+        # --- MANEJO DE ERRORES ---
         if status != 200:
-            await interaction.followup.send("❌ Servidor de Linhir no disponible.", ephemeral=True)
+            error_msg = "Servidor de Linhir no disponible."
+            if status == 422:
+                error_msg = result.get("error", "Datos inválidos. Revisa el nombre y la fecha de nacimiento.")
+            elif status == 500:
+                error_msg = "Error interno en el servidor (Laravel). Contacta a un administrador."
+            
+            await interaction.followup.send(f"❌ {error_msg}", ephemeral=True)
             return
 
         if not result.get("success") and result.get("ambiguous"):
@@ -282,8 +273,10 @@ class IdentityCog(commands.Cog):
             await responder.followup.send(f"🔐 {exc}", ephemeral=True)
             return
 
+        # --- MANEJO DE ERRORES ---
         if status != 200 or not result.get("success"):
-            await responder.followup.send(f"❌ {result.get('reason', 'Error.')}", ephemeral=True)
+            error_msg = result.get("reason") or result.get("error") or "Error desconocido."
+            await responder.followup.send(f"❌ {error_msg}", ephemeral=True)
             return
 
         await self._apply_and_respond(
@@ -402,7 +395,6 @@ class IdentityCog(commands.Cog):
 
         roles_to_add = [r for r in (linhir_role, publico_role, hrl_role) if r]
 
-        # Quitar cualquier rol de aliado previo
         allied_role_ids = await self._get_allied_role_ids()
         roles_to_remove = [r for r in member.roles if r.id in allied_role_ids]
 

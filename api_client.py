@@ -92,8 +92,24 @@ class APIClient:
                             "Verifica las abilities del token."
                         )
 
+                    # --- MANEJO DE ERRORES DE LARAVEL ---
                     if resp.status >= 400:
                         logger.warning("API %s %s → %s: %s", method, path, resp.status, body)
+                        
+                        # Error de validación (422 Unprocessable Entity)
+                        if resp.status == 422 and isinstance(body, dict) and "errors" in body:
+                            errors = body["errors"]
+                            if errors:
+                                first_error = list(errors.values())[0][0]
+                                return {"error": first_error}, 422
+                            return {"error": body.get("message", "Datos inválidos.")}, 422
+                        
+                        # Error interno del servidor (500)
+                        if resp.status == 500:
+                            return {"error": "Error interno en el servidor de Linhir. Revisa los logs."}, 500
+                        
+                        # Otros errores
+                        return body, resp.status
 
                     return body, resp.status
 
@@ -121,36 +137,23 @@ class APIClient:
 
     @classmethod
     async def get_server_time(cls) -> tuple[dict, int]:
-        """
-        GET /api/bot/horario
-        Retorna: {"timestamp": int, "utc": "...", "venezuela": "...", ...}
-        """
+        """GET /api/bot/horario"""
         return await cls._get("/horario")
 
     @classmethod
     async def get_gold_price(cls) -> tuple[dict, int]:
-        """
-        GET /api/bot/oro
-        Retorna: {"price": int, "timestamp": "Y-m-d H:i:s"}
-        """
+        """GET /api/bot/oro"""
         return await cls._get("/oro")
 
     @classmethod
     async def sync_registration(cls, discord_user_id: str) -> tuple[dict, int]:
-        """
-        POST /api/bot/sync-registration
-        Re-consulta Albion y devuelve si el personaje sigue siendo miembro del gremio.
-        """
+        """POST /api/bot/sync-registration"""
         payload = {"discord_user_id": discord_user_id}
         return await cls._request("POST", "/sync-registration", payload)
 
     @classmethod
     async def get_registered_members(cls) -> tuple[dict, int]:
-        """
-        GET /api/bot/members
-        Devuelve el roster completo del gremio con estado de vinculación Discord.
-        Estructura: {success, guild_id, totals, guild_registered, guild_unregistered, all_linked}
-        """
+        """GET /api/bot/members"""
         return await cls._get("/members")
 
     @classmethod
@@ -168,12 +171,7 @@ class APIClient:
         discord_username: str | None = None,
         performed_by_discord_id: str | None = None,
     ) -> tuple[dict, int]:
-        """
-        POST /api/bot/register-character
-
-        Acepta `character_id` (consulta directa, sin ambigüedad) O
-        `character_name` (búsqueda por nombre). Al menos uno debe venir.
-        """
+        """POST /api/bot/register-character"""
         payload: dict = {"discord_user_id": discord_user_id}
         if character_id:
             payload["character_id"] = character_id
@@ -187,256 +185,113 @@ class APIClient:
             payload["performed_by_discord_id"] = performed_by_discord_id
         return await cls._request("POST", "/register-character", payload)
 
-    # ============================ Banco personal ============================
-
     @classmethod
     async def get_my_balance(cls, discord_user_id: str) -> tuple[dict, int]:
-        """
-        GET /api/bot/members/{discord_user_id}/balance
-        Retorna: {success, personaje_name, balance, ingresos, egresos}
-        """
         return await cls._get(f"/members/{discord_user_id}/balance")
 
-    # ============================ Retiros ============================
+    @classmethod
+    async def create_withdrawal(cls, discord_user_id: str, amount: int) -> tuple[dict, int]:
+        return await cls._request("POST", "/withdrawals", {"discord_user_id": discord_user_id, "amount": int(amount)})
 
     @classmethod
-    async def create_withdrawal(
-        cls, discord_user_id: str, amount: int
-    ) -> tuple[dict, int]:
-        """
-        POST /api/bot/withdrawals
-        Crea una solicitud de retiro. El backend valida saldo y solicitudes previas.
-        """
-        payload = {"discord_user_id": discord_user_id, "amount": int(amount)}
-        return await cls._request("POST", "/withdrawals", payload)
-
-    @classmethod
-    async def get_my_withdrawals(
-        cls, discord_user_id: str, limit: int = 10
-    ) -> tuple[dict, int]:
-        """
-        GET /api/bot/withdrawals/mine?discord_user_id=X&limit=N
-        Historial del usuario (más recientes primero).
-        """
-        path = f"/withdrawals/mine?discord_user_id={discord_user_id}&limit={int(limit)}"
-        return await cls._get(path)
+    async def get_my_withdrawals(cls, discord_user_id: str, limit: int = 10) -> tuple[dict, int]:
+        return await cls._get(f"/withdrawals/mine?discord_user_id={discord_user_id}&limit={int(limit)}")
 
     @classmethod
     async def get_pending_withdrawals(cls) -> tuple[dict, int]:
-        """GET /api/bot/withdrawals/pending"""
         return await cls._get("/withdrawals/pending")
 
     @classmethod
-    async def approve_withdrawal(
-        cls,
-        withdrawal_id: int,
-        reviewer_discord_id: str,
-        reviewer_name: str,
-    ) -> tuple[dict, int]:
-        """POST /api/bot/withdrawals/{id}/approve"""
-        payload = {
-            "reviewer_discord_id": reviewer_discord_id,
-            "reviewer_name":       reviewer_name,
-        }
+    async def approve_withdrawal(cls, withdrawal_id: int, reviewer_discord_id: str, reviewer_name: str) -> tuple[dict, int]:
+        payload = {"reviewer_discord_id": reviewer_discord_id, "reviewer_name": reviewer_name}
         return await cls._request("POST", f"/withdrawals/{withdrawal_id}/approve", payload)
 
     @classmethod
-    async def reject_withdrawal(
-        cls,
-        withdrawal_id: int,
-        reviewer_discord_id: str,
-        reviewer_name: str,
-        reason: str,
-    ) -> tuple[dict, int]:
-        """POST /api/bot/withdrawals/{id}/reject"""
-        payload = {
-            "reviewer_discord_id": reviewer_discord_id,
-            "reviewer_name":       reviewer_name,
-            "reason":              reason[:255],
-        }
+    async def reject_withdrawal(cls, withdrawal_id: int, reviewer_discord_id: str, reviewer_name: str, reason: str) -> tuple[dict, int]:
+        payload = {"reviewer_discord_id": reviewer_discord_id, "reviewer_name": reviewer_name, "reason": reason[:255]}
         return await cls._request("POST", f"/withdrawals/{withdrawal_id}/reject", payload)
-
-    # ============================ Cuenta del gremio ============================
 
     @classmethod
     async def get_guild_balance(cls) -> tuple[dict, int]:
-        """GET /api/bot/guild-balance"""
         return await cls._get("/guild-balance")
 
     @classmethod
-    async def get_guild_transactions(
-        cls,
-        limit: int = 15,
-        offset: int = 0,
-        tipo: str | None = None,
-    ) -> tuple[dict, int]:
-        """
-        GET /api/bot/guild-transactions?limit=&offset=&type=
-        `tipo` ∈ {inicial, ingreso, egreso, None}
-        """
+    async def get_guild_transactions(cls, limit: int = 15, offset: int = 0, tipo: str | None = None) -> tuple[dict, int]:
         path = f"/guild-transactions?limit={int(limit)}&offset={int(offset)}"
         if tipo:
             path += f"&type={tipo}"
         return await cls._get(path)
 
     @classmethod
-    async def create_guild_transaction(
-        cls,
-        tipo: str,
-        amount: int,
-        reason: str,
-        performed_by_discord_id: str,
-        performed_by_name: str,
-        image_url: str | None = None,
-    ) -> tuple[dict, int]:
-        """POST /api/bot/guild-transactions"""
-        payload = {
-            "type":                    tipo,
-            "amount":                  int(amount),
-            "reason":                  reason[:255],
-            "performed_by_discord_id": performed_by_discord_id,
-            "performed_by_name":       performed_by_name,
-        }
+    async def create_guild_transaction(cls, tipo: str, amount: int, reason: str, performed_by_discord_id: str, performed_by_name: str, image_url: str | None = None) -> tuple[dict, int]:
+        payload = {"type": tipo, "amount": int(amount), "reason": reason[:255], "performed_by_discord_id": performed_by_discord_id, "performed_by_name": performed_by_name}
         if image_url:
             payload["image_url"] = image_url
         return await cls._request("POST", "/guild-transactions", payload)
 
-    # ============================ Actividades ============================
-
     @classmethod
     async def create_activity(cls, payload: dict) -> tuple[dict, int]:
-        """
-        POST /api/bot/activities
-        Registra una actividad y distribuye silver entre los participantes.
-        El payload debe incluir: name, start_time, end_time, liquid_silver,
-        items_value, pro_guild, participants[], registered_by_discord_id,
-        registered_by_name. `cta_id` es opcional.
-        """
         return await cls._request("POST", "/activities", payload)
 
     @classmethod
-    async def get_activities(
-        cls, limit: int = 20, offset: int = 0
-    ) -> tuple[dict, int]:
-        """GET /api/bot/activities?limit=&offset= (más recientes primero)."""
-        path = f"/activities?limit={int(limit)}&offset={int(offset)}"
-        return await cls._get(path)
+    async def get_activities(cls, limit: int = 20, offset: int = 0) -> tuple[dict, int]:
+        return await cls._get(f"/activities?limit={int(limit)}&offset={int(offset)}")
 
     @classmethod
     async def get_activity(cls, activity_id: int) -> tuple[dict, int]:
-        """GET /api/bot/activities/{id} — detalle con participantes."""
         return await cls._get(f"/activities/{int(activity_id)}")
-
-    # ============================ Composiciones ============================
 
     @classmethod
     async def get_compositions(cls) -> tuple[dict, int]:
-        """GET /api/bot/compositions — lista composiciones activas."""
         return await cls._get("/compositions")
 
     @classmethod
-    async def create_composition(
-        cls,
-        name: str,
-        description: str | None,
-        weapons: list[dict],
-    ) -> tuple[dict, int]:
-        """
-        POST /api/bot/compositions
-        `weapons` es una lista de {name: str, icon: str | None}
-        """
-        payload = {
-            "name": name[:120],
-            "weapons": [
-                {
-                    "name": w["name"][:120],
-                    "icon": (w.get("icon") or None),
-                }
-                for w in weapons
-            ],
-        }
+    async def create_composition(cls, name: str, description: str | None, weapons: list[dict]) -> tuple[dict, int]:
+        payload = {"name": name[:120], "weapons": [{"name": w["name"][:120], "icon": (w.get("icon") or None)} for w in weapons]}
         if description:
             payload["description"] = description[:500]
         return await cls._request("POST", "/compositions", payload)
 
     @classmethod
     async def delete_composition(cls, composition_id: int) -> tuple[dict, int]:
-        """DELETE /api/bot/compositions/{id} — soft delete (active=false)."""
         return await cls._request("DELETE", f"/compositions/{int(composition_id)}")
-
-    # ============================ CTAs ============================
 
     @classmethod
     async def get_active_ctas(cls) -> tuple[dict, int]:
-        """GET /api/bot/ctas/active — CTAs programadas futuras."""
         return await cls._get("/ctas/active")
 
     @classmethod
     async def get_cta(cls, cta_id: int) -> tuple[dict, int]:
-        """GET /api/bot/ctas/{id} — detalle con armas y participantes."""
         return await cls._get(f"/ctas/{int(cta_id)}")
 
     @classmethod
     async def create_cta(cls, payload: dict) -> tuple[dict, int]:
-        """
-        POST /api/bot/ctas
-        Registra una CTA. El bot debe haber creado ya el evento y mensaje
-        de Discord, y pasa sus IDs aquí.
-        """
         return await cls._request("POST", "/ctas", payload)
 
     @classmethod
-    async def cta_join(
-        cls,
-        cta_id: int,
-        discord_user_id: str,
-        user_name: str,
-        weapon_id: int,
-    ) -> tuple[dict, int]:
-        """POST /api/bot/ctas/{id}/join"""
-        payload = {
-            "discord_user_id": discord_user_id,
-            "user_name":       user_name,
-            "weapon_id":       int(weapon_id),
-        }
+    async def cta_join(cls, cta_id: int, discord_user_id: str, user_name: str, weapon_id: int) -> tuple[dict, int]:
+        payload = {"discord_user_id": discord_user_id, "user_name": user_name, "weapon_id": int(weapon_id)}
         return await cls._request("POST", f"/ctas/{int(cta_id)}/join", payload)
 
     @classmethod
-    async def cta_absent(
-        cls, cta_id: int, discord_user_id: str
-    ) -> tuple[dict, int]:
-        """POST /api/bot/ctas/{id}/absent"""
+    async def cta_absent(cls, cta_id: int, discord_user_id: str) -> tuple[dict, int]:
         payload = {"discord_user_id": discord_user_id}
         return await cls._request("POST", f"/ctas/{int(cta_id)}/absent", payload)
 
     @classmethod
     async def cta_cancel(cls, cta_id: int) -> tuple[dict, int]:
-        """POST /api/bot/ctas/{id}/cancel"""
         return await cls._request("POST", f"/ctas/{int(cta_id)}/cancel")
 
     @classmethod
     async def get_pending_reminders(cls) -> tuple[dict, int]:
-        """GET /api/bot/ctas/pending-reminders"""
         return await cls._get("/ctas/pending-reminders")
 
     @classmethod
     async def mark_reminder_sent(cls, cta_id: int) -> tuple[dict, int]:
-        """POST /api/bot/ctas/{id}/reminder-sent"""
         return await cls._request("POST", f"/ctas/{int(cta_id)}/reminder-sent")
 
     @classmethod
-    async def get_ctas(
-        cls,
-        status: str | None = None,
-        paid: bool | None = None,
-        limit: int = 20,
-        offset: int = 0,
-        order: str = "desc",
-    ) -> tuple[dict, int]:
-        """
-        GET /api/bot/ctas?status=&paid=&limit=&offset=&order=
-        Listado de CTAs con filtros opcionales.
-        """
+    async def get_ctas(cls, status: str | None = None, paid: bool | None = None, limit: int = 20, offset: int = 0, order: str = "desc") -> tuple[dict, int]:
         params = [f"limit={int(limit)}", f"offset={int(offset)}", f"order={order}"]
         if status:
             params.append(f"status={status}")
@@ -447,13 +302,8 @@ class APIClient:
 
     @classmethod
     async def get_pending_payment_ctas(cls) -> tuple[dict, int]:
-        """GET /api/bot/ctas/pending-payment — CTAs pasadas sin pagar."""
         return await cls._get("/ctas/pending-payment")
     
     @classmethod
     async def get_allied_guilds(cls) -> tuple[dict, int]:
-        """
-        GET /api/bot/allied-guilds
-        Catálogo de gremios aliados activos y configurados.
-        """
         return await cls._get("/allied-guilds")
