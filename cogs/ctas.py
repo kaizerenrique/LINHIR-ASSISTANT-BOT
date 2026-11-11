@@ -362,11 +362,12 @@ class CtaAnnouncementView(discord.ui.View):
 class AnnouncementTimeView(discord.ui.View):
     """Vista para que el oficial decida cuándo se envía el ping."""
 
-    def __init__(self, cta_id: int, channel_id: int, role_id: int, author_id: int, timeout: int = 60):
+    def __init__(self, cta_id: int, channel_id: int, role_id: int, author_id: int, start_time: datetime, timeout: int = 60):
         super().__init__(timeout=timeout)
         self.cta_id = cta_id
         self.channel_id = channel_id
         self.role_id = role_id
+        self.start_time = start_time
         self.author_id = author_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -377,33 +378,48 @@ class AnnouncementTimeView(discord.ui.View):
 
     async def _process_choice(self, interaction: discord.Interaction, minutes_before: int | None):
         await interaction.response.defer(ephemeral=True)
-        
-        # Calcular fecha de anuncio
-        if minutes_before is None:
-            announce_at = datetime.now(timezone.utc)
-        else:
-            announce_at = start_dt - timedelta(minutes=minutes_before)
-            if announce_at < datetime.now(timezone.utc):
-                announce_at = datetime.now(timezone.utc)
 
-        # Enviar a la API
+        now = datetime.now(timezone.utc)
+
+        if minutes_before is None:
+            announce_at = now
+        else:
+            announce_at = self.start_time - timedelta(minutes=minutes_before)
+            # Si el momento calculado ya pasó, anunciar ya
+            if announce_at < now:
+                announce_at = now
+
         try:
-            result, status = await APIClient.update_cta_announce(self.cta_id, announce_at)
-            
+            result, status = await APIClient.update_cta_announce(
+                self.cta_id, announce_at.isoformat()
+            )
+
             if status == 200 and result.get("success"):
                 if minutes_before is None:
                     msg = "✅ El anuncio se enviará inmediatamente en unos segundos."
+                elif announce_at == now:
+                    msg = ("⚠️ El momento calculado ya había pasado. "
+                           "El anuncio se enviará **inmediatamente** en unos segundos.")
                 else:
-                    ts = int((datetime.now(timezone.utc) + timedelta(minutes=minutes_before)).timestamp())
+                    ts = int(announce_at.timestamp())
                     msg = f"✅ El anuncio se enviará automáticamente <t:{ts}:R>."
-                
-                embed = discord.Embed(title="⏳ Anuncio Programado", description=msg, color=Config.EMBED_COLOR)
+
+                embed = discord.Embed(
+                    title="⏳ Anuncio Programado",
+                    description=msg,
+                    color=Config.EMBED_COLOR,
+                )
                 await interaction.followup.send(embed=embed, ephemeral=True)
             else:
-                await interaction.followup.send(f"❌ Error al programar: {result.get('reason')}", ephemeral=True)
+                error = result.get("reason") or result.get("error") or "Error desconocido"
+                await interaction.followup.send(
+                    f"❌ Error al programar: {error}", ephemeral=True
+                )
         except Exception as exc:
-            logger.error("Error programando anuncio: %s", exc)
-            await interaction.followup.send("❌ Error de conexión con el servidor.", ephemeral=True)
+            logger.error("Error programando anuncio: %s", exc, exc_info=exc)
+            await interaction.followup.send(
+                "❌ Error de conexión con el servidor.", ephemeral=True
+            )
 
         self.stop()
 
@@ -994,10 +1010,10 @@ class CtasCog(commands.Cog):
         if visibilidad.value == "alliance": loot_val = "full_split"
 
         # 1. Crear evento de Discord
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = datetime.fromisoformat(end_iso)
         discord_event_id = None
-        try:
-            start_dt = datetime.fromisoformat(start_iso)
-            end_dt = datetime.fromisoformat(end_iso)
+        try:            
             event = await interaction.guild.create_scheduled_event(
                 name=f"⚔️ {titulo}"[:100],
                 description=f"CTA de {Config.GUILD_NAME}. Ubicación: {ubicacion}"[:1000],
@@ -1040,7 +1056,7 @@ class CtasCog(commands.Cog):
             ch_id = Config.CTA_ANNOUNCE_CHANNEL_ID if visibilidad.value == "linhir" else Config.CTA_CONTENT_CHANNEL_ID
             role_id = Config.LINHIR_ROLE_ID if visibilidad.value == "linhir" else Config.HRL_ROLE_ID
             
-            view = AnnouncementTimeView(cta_id, ch_id, role_id, interaction.user.id)
+            view = AnnouncementTimeView(cta_id, ch_id, role_id, interaction.user.id, start_time=start_dt)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
         except Exception as exc:
