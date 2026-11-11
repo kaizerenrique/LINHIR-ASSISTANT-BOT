@@ -895,8 +895,11 @@ class CtasCog(commands.Cog):
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot: return
 
-        # SALIÓ
-        if before.channel and not after.channel:
+        if before.channel == after.channel:
+            return
+
+        # SALIÓ (o se movió fuera del canal CTA)
+        if before.channel:
             cta_id = await self._get_cta_id_by_voice_channel(before.channel.id)
             if cta_id:
                 join_time = VOICE_SESSIONS.get(cta_id, {}).pop(member.id, None)
@@ -905,11 +908,12 @@ class CtasCog(commands.Cog):
                     if seconds > 0:
                         await APIClient.add_voice_time(cta_id, str(member.id), seconds)
 
-        # ENTRÓ
-        elif not before.channel and after.channel:
+        # ENTRÓ (o se movió a un canal CTA)
+        if after.channel:
             cta_id = await self._get_cta_id_by_voice_channel(after.channel.id)
             if cta_id:
-                if cta_id not in VOICE_SESSIONS: VOICE_SESSIONS[cta_id] = {}
+                if cta_id not in VOICE_SESSIONS:
+                    VOICE_SESSIONS[cta_id] = {}
                 VOICE_SESSIONS[cta_id][member.id] = datetime.now(timezone.utc)
 
                 try:
