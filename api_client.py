@@ -307,3 +307,27 @@ class APIClient:
     @classmethod
     async def get_allied_guilds(cls) -> tuple[dict, int]:
         return await cls._get("/allied-guilds")
+    
+    @classmethod
+    async def get_pending_announcements(cls) -> tuple[dict, int]:
+        return await cls._get("/ctas/pending-announcements")
+
+    @classmethod
+    async def mark_announced(cls, cta_id: int, message_id: str, channel_id: str) -> tuple[dict, int]:
+        payload = {"discord_message_id": message_id, "discord_channel_id": channel_id}
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/mark-announced", payload)
+
+    @classmethod
+    async def update_voice_channel(cls, cta_id: int, voice_channel_id: str) -> tuple[dict, int]:
+        payload = {"discord_voice_channel_id": voice_channel_id}
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/voice-channel", payload)
+
+    @classmethod
+    async def add_voice_time(cls, cta_id: int, discord_user_id: str, seconds: int) -> tuple[dict, int]:
+        payload = {"discord_user_id": discord_user_id, "seconds": seconds}
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/voice-time", payload)
+    
+    @classmethod
+    async def update_cta_announce(cls, cta_id: int, announce_at: str) -> tuple[dict, int]:
+        payload = {"announce_at": announce_at}
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/announce", payload)

@@ -1,4 +1,4 @@
-"""Cog de CTAs: creación, inscripción, ausencias, pagos y recordatorios.
+"""Cog de CTAs: creación, inscripción, ausencias, pagos, anuncios y voz.
 
 Arquitectura de los botones:
   - Los mensajes de CTA contienen botones con custom_id dinámicos:
@@ -18,11 +18,17 @@ Arquitectura de los botones:
   - El regex acepta tanto `linhir:cta:*` (lo que publica la web y este
     cog) como `cta:*` (formato usado por versiones anteriores del bot),
     garantizando retrocompatibilidad con mensajes ya publicados.
+
+Nuevas funcionalidades:
+  - Anuncios diferidos: El bot revisa CTAs sin anunciar y las publica.
+  - Canales de voz automáticos: Crea el canal 10 min antes y lo borra al quedar vacío.
+  - Medición de asistencia: Cuenta los segundos que un usuario pasa en el canal de voz.
 """
 
 import logging
 import re
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
@@ -45,6 +51,10 @@ CTA_REFRESH_RE = re.compile(r"^(?:linhir:)?cta:refresh:(\d+)$")
 
 # Límite duro de Discord para field.value en un embed
 _FIELD_VALUE_MAX = 1024
+
+# Cache en memoria para rastrear cuándo un usuario entra al canal de voz
+# Estructura: { cta_id: { user_id: join_datetime } }
+VOICE_SESSIONS: dict[int, dict[int, datetime]] = {}
 
 
 # ===================================================================== #
@@ -346,6 +356,73 @@ class CtaAnnouncementView(discord.ui.View):
 
 
 # ===================================================================== #
+#             Vista efímera: Selección de hora de anuncio               #
+# ===================================================================== #
+
+class AnnouncementTimeView(discord.ui.View):
+    """Vista para que el oficial decida cuándo se envía el ping."""
+
+    def __init__(self, cta_id: int, channel_id: int, role_id: int, author_id: int, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.cta_id = cta_id
+        self.channel_id = channel_id
+        self.role_id = role_id
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Solo el creador puede elegir.", ephemeral=True)
+            return False
+        return True
+
+    async def _process_choice(self, interaction: discord.Interaction, minutes_before: int | None):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Calcular fecha de anuncio
+        if minutes_before is None:
+            announce_at = datetime.now(timezone.utc).isoformat()
+        else:
+            announce_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes_before)).isoformat()
+
+        # Enviar a la API
+        try:
+            result, status = await APIClient.update_cta_announce(self.cta_id, announce_at)
+            
+            if status == 200 and result.get("success"):
+                if minutes_before is None:
+                    msg = "✅ El anuncio se enviará inmediatamente en unos segundos."
+                else:
+                    ts = int((datetime.now(timezone.utc) + timedelta(minutes=minutes_before)).timestamp())
+                    msg = f"✅ El anuncio se enviará automáticamente <t:{ts}:R>."
+                
+                embed = discord.Embed(title="⏳ Anuncio Programado", description=msg, color=Config.EMBED_COLOR)
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error al programar: {result.get('reason')}", ephemeral=True)
+        except Exception as exc:
+            logger.error("Error programando anuncio: %s", exc)
+            await interaction.followup.send("❌ Error de conexión con el servidor.", ephemeral=True)
+
+        self.stop()
+
+    @discord.ui.button(label="Inmediato", style=discord.ButtonStyle.primary)
+    async def btn_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_choice(interaction, None)
+
+    @discord.ui.button(label="15 min antes", style=discord.ButtonStyle.secondary)
+    async def btn_15m(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_choice(interaction, 15)
+
+    @discord.ui.button(label="1 hora antes", style=discord.ButtonStyle.secondary)
+    async def btn_1h(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_choice(interaction, 60)
+
+    @discord.ui.button(label="2 horas antes", style=discord.ButtonStyle.secondary)
+    async def btn_2h(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_choice(interaction, 120)
+    
+
+# ===================================================================== #
 #                        Constructor de embed                           #
 # ===================================================================== #
 
@@ -408,6 +485,10 @@ def build_cta_embed(cta: dict) -> discord.Embed:
     composition = cta.get("composition") or {}
     weapons = composition.get("weapons") or []
     participants = cta.get("participants") or []
+    
+    # Nuevos campos
+    visibility = cta.get("visibility", "linhir")
+    loot_type = cta.get("loot_type", "taxed_split")
 
     color_map = {
         "scheduled": Config.EMBED_COLOR,
@@ -415,11 +496,22 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         "completed": 0x5CCB45,
     }
     color = color_map.get(status, Config.EMBED_COLOR)
+    
+    vis_icon = "🤝" if visibility == "alliance" else "🛡️"
+    vis_txt = "Alianza HRL" if visibility == "alliance" else "Solo Linhir"
+    
+    loot_map = {
+        "full_split": "Full Split (Sin impuestos)",
+        "taxed_split": "Split con Impuesto (15%)",
+        "pro_guild": "Pro-Gremio (Todo al banco)"
+    }
+    loot_txt = loot_map.get(loot_type, loot_type)
 
     embed = discord.Embed(
         title=f"⚔️ {title}",
         description=(
             f"📍 **{location}**\n"
+            f"{vis_icon} **{vis_txt}** | 💰 **{loot_txt}**\n"
             f"🎭 Composición: **{composition.get('name', '—')}**"
         ),
         color=color,
@@ -432,11 +524,7 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         try:
             start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
             ts = int(start_dt.timestamp())
-            embed.add_field(
-                name="⏰ Inicio",
-                value=f"<t:{ts}:F>\n(<t:{ts}:R>)",
-                inline=True,
-            )
+            embed.add_field(name="⏰ Inicio", value=f"<t:{ts}:F>\n(<t:{ts}:R>)", inline=True)
         except (ValueError, TypeError):
             embed.add_field(name="⏰ Inicio", value=start_iso, inline=True)
 
@@ -453,8 +541,7 @@ def build_cta_embed(cta: dict) -> discord.Embed:
         embed.add_field(name="Estado", value="❌ **Cancelada**", inline=True)
     elif status == "completed":
         estado_txt = "✅ Completada"
-        if paid:
-            estado_txt += " · 💵 Pagada"
+        if paid: estado_txt += " · 💵 Pagada"
         embed.add_field(name="Estado", value=estado_txt, inline=True)
     elif paid:
         embed.add_field(name="Estado", value="💵 **Pagada**", inline=True)
@@ -523,17 +610,17 @@ class CtasCog(commands.Cog):
     async def cog_load(self):
         await self._verify_cta_publications()
         self.reminder_loop.start()
+        self.announcement_loop.start()
+        self.voice_channel_loop.start()
+        self.empty_channel_cleanup_loop.start()
 
     async def cog_unload(self):
         self.reminder_loop.cancel()
+        self.announcement_loop.cancel()
+        self.voice_channel_loop.cancel()
+        self.empty_channel_cleanup_loop.cancel()
 
     async def _verify_cta_publications(self):
-        """
-        Verifica cuántas CTAs activas tienen IDs de Discord guardados.
-
-        NO registra vistas persistentes: los botones se manejan con
-        `on_interaction`. Solo hace un log de diagnóstico.
-        """
         try:
             result, status = await APIClient.get_active_ctas()
         except (AuthenticationError, AuthorizationError):
@@ -543,13 +630,9 @@ class CtasCog(commands.Cog):
             return
 
         ctas = result.get("ctas", [])
-        with_ids = sum(
-            1 for c in ctas
-            if c.get("discord_message_id") and c.get("discord_channel_id")
-        )
+        with_ids = sum(1 for c in ctas if c.get("discord_message_id") and c.get("discord_channel_id"))
         logger.info(
-            "CTAs activas: %d · con IDs de Discord: %d/%d "
-            "(los botones se manejan con on_interaction)",
+            "CTAs activas: %d · con IDs de Discord: %d/%d (on_interaction)",
             len(ctas), with_ids, len(ctas),
         )
 
@@ -559,29 +642,12 @@ class CtasCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
-        """
-        Captura TODOS los botones con custom_id de CTA (web + bot).
-
-        Patrón aceptado:
-          linhir:cta:join:{id}     (formato actual, web y bot)
-          linhir:cta:absent:{id}
-          linhir:cta:refresh:{id}
-          cta:join:{id}            (formato legacy, retrocompatible)
-          cta:absent:{id}
-          cta:refresh:{id}
-        """
         if interaction.type != discord.InteractionType.component:
             return
 
-        custom_id = (
-            interaction.data.get("custom_id", "")
-            if interaction.data else ""
-        )
+        custom_id = interaction.data.get("custom_id", "") if interaction.data else ""
 
-        logger.info(
-            "CTA interaction: custom_id=%r user=%s",
-            custom_id, interaction.user,
-        )
+        logger.info("CTA interaction: custom_id=%r user=%s", custom_id, interaction.user)
 
         m = CTA_JOIN_RE.match(custom_id)
         if m:
@@ -598,58 +664,36 @@ class CtasCog(commands.Cog):
             await self._handle_refresh_btn(interaction, int(m.group(1)))
             return
 
-        logger.debug("CTA interaction ignorada (no match): %r", custom_id)
-
     # ================================================================== #
     #                    HANDLERS DE BOTONES                              #
     # ================================================================== #
 
     async def _handle_join_btn(self, interaction: discord.Interaction, cta_id: int):
-        """Handler del botón 'Unirse': defer inmediato → get_cta → selector."""
-        # 1. DEFER PRIMERO (antes de cualquier llamada a la API)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        # 2. Consultar CTA
         try:
             result, status = await APIClient.get_cta(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
         except Exception as exc:
             logger.exception("join_btn: error get_cta %s", cta_id)
-            await interaction.followup.send(
-                f"❌ No se pudo consultar la CTA: {exc}", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ Error de conexión: {exc}", ephemeral=True)
             return
 
         if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                "❌ No se pudo cargar la CTA.", ephemeral=True
-            )
+            await interaction.followup.send("❌ No se pudo cargar la CTA.", ephemeral=True)
             return
 
         cta = result["cta"]
         if cta.get("status") != "scheduled":
-            await interaction.followup.send(
-                "❌ Esta CTA ya no está activa.", ephemeral=True
-            )
+            await interaction.followup.send("❌ Esta CTA ya no está activa.", ephemeral=True)
             return
 
-        composition = cta.get("composition") or {}
-        weapons = composition.get("weapons") or []
-
-        occupancy: dict[str, str] = {}
-        for p in cta.get("participants") or []:
-            if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
-                occupancy[str(p["composition_weapon_id"])] = p["user_name"]
+        weapons = (cta.get("composition") or {}).get("weapons") or []
+        occupancy = {str(p["composition_weapon_id"]): p["user_name"] for p in cta.get("participants") or [] if p.get("status") == "confirmed" and p.get("composition_weapon_id")}
 
         if not weapons:
-            await interaction.followup.send(
-                "⚠️ Esta CTA no tiene composición con armas.", ephemeral=True
-            )
+            await interaction.followup.send("⚠️ Esta CTA no tiene armas.", ephemeral=True)
             return
 
-        # 3. Selector de arma efímero
         view = WeaponSelectView(
             cta_id=cta_id,
             weapons=weapons,
@@ -660,153 +704,242 @@ class CtasCog(commands.Cog):
         )
         view.bot = interaction.client
 
-        await interaction.followup.send(
-            "Selecciona el arma con la que participarás:",
-            view=view,
-            ephemeral=True,
-        )
+        await interaction.followup.send("Selecciona el arma con la que participarás:", view=view, ephemeral=True)
 
     async def _handle_absent_btn(self, interaction: discord.Interaction, cta_id: int):
-        """Handler del botón 'Ausente': defer primero, luego API."""
         await interaction.response.defer(ephemeral=True)
 
         try:
-            result, status = await APIClient.cta_absent(
-                cta_id, str(interaction.user.id)
-            )
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            result, status = await APIClient.cta_absent(cta_id, str(interaction.user.id))
         except Exception as exc:
-            logger.exception("absent_btn: error %s", cta_id)
             await interaction.followup.send(f"❌ Error: {exc}", ephemeral=True)
             return
 
         if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo registrar tu ausencia.')}",
-                ephemeral=True,
-            )
+            await interaction.followup.send(f"❌ {result.get('reason', 'Error al ausentarse.')}", ephemeral=True)
             return
 
-        await interaction.followup.send(
-            "🚫 Marcado como ausente. Se ha liberado tu arma (si tenías una).",
-            ephemeral=True,
-        )
-
+        await interaction.followup.send("🚫 Marcado como ausente. Se ha liberado tu arma.", ephemeral=True)
         await self._refresh_public_cta_message(interaction, cta_id)
 
     async def _handle_refresh_btn(self, interaction: discord.Interaction, cta_id: int):
-        """Handler del botón '🔄': defer primero, luego refrescar mensaje."""
         await interaction.response.defer()
         await self._refresh_public_cta_message(interaction, cta_id)
 
-    async def _refresh_public_cta_message(
-        self, interaction: discord.Interaction, cta_id: int
-    ):
-        """Recarga la CTA y edita el mensaje público original (si se puede)."""
+    async def _refresh_public_cta_message(self, interaction: discord.Interaction, cta_id: int):
         if not interaction.message:
             return
 
         try:
             result, status = await APIClient.get_cta(cta_id)
-            if status != 200 or not result.get("success"):
-                return
-
-            embed = build_cta_embed(result["cta"])
-            new_view = CtaAnnouncementView(cta_id=cta_id)
-
-            await interaction.message.edit(embed=embed, view=new_view)
+            if status == 200 and result.get("success"):
+                embed = build_cta_embed(result["cta"])
+                new_view = CtaAnnouncementView(cta_id=cta_id)
+                await interaction.message.edit(embed=embed, view=new_view)
         except Exception as exc:
             logger.warning("No se pudo refrescar CTA #%s: %s", cta_id, exc)
 
     # ================================================================== #
-    #                     Tarea: recordatorios por DM                     #
+    #                     Tareas en segundo plano                        #
     # ================================================================== #
 
     @tasks.loop(seconds=60)
     async def reminder_loop(self):
         try:
-            await self._process_reminders()
+            result, status = await APIClient.get_pending_reminders()
+            if status != 200 or not result.get("success"): return
+
+            for cta in result.get("ctas", []):
+                cta_id = cta["id"]
+                participants = cta.get("confirmed_participants") or []
+                
+                if not participants:
+                    await APIClient.mark_reminder_sent(cta_id)
+                    continue
+
+                start_iso = cta.get("start_time")
+                start_fmt = start_iso
+                try:
+                    start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                    start_fmt = f"<t:{int(start_dt.timestamp())}:R>"
+                except (ValueError, TypeError, AttributeError):
+                    pass
+
+                body = f"🔔 **Recordatorio de CTA**\n\n**{cta.get('title', '—')}**\n📍 {cta.get('location', '—')}\n⏰ Inicia {start_fmt}\n\n¡No olvides asistir!"
+
+                for p in participants:
+                    uid = p.get("discord_user_id")
+                    if not uid: continue
+                    try:
+                        user = await self.bot.fetch_user(int(uid))
+                        await user.send(body)
+                    except (discord.Forbidden, discord.NotFound):
+                        pass
+                    except discord.HTTPException as exc:
+                        logger.warning("DM fallo para %s: %s", uid, exc)
+
+                await APIClient.mark_reminder_sent(cta_id)
+                logger.info("Recordatorio CTA #%s enviado", cta_id)
+
         except Exception as exc:
             logger.exception("Error en reminder_loop: %s", exc)
 
-    @reminder_loop.before_loop
-    async def before_reminder_loop(self):
-        await self.bot.wait_until_ready()
-        self.reminder_loop.change_interval(
-            seconds=Config.CTA_REMINDER_POLL_SECONDS
-        )
-        logger.info(
-            "Poller de recordatorios de CTAs iniciado (cada %ds)",
-            Config.CTA_REMINDER_POLL_SECONDS,
-        )
-
-    async def _process_reminders(self):
+    @tasks.loop(seconds=60)
+    async def announcement_loop(self):
+        """Revisa CTAs pendientes de anuncio y las publica."""
         try:
-            result, status = await APIClient.get_pending_reminders()
-        except (AuthenticationError, AuthorizationError) as exc:
-            logger.warning("Recordatorios: auth error %s", exc)
-            return
+            result, status = await APIClient.get_pending_announcements()
+            if status != 200 or not result.get("success"): return
+            
+            for cta in result.get("ctas", []):
+                cta_id = cta["id"]
+                vis = cta.get("visibility", "linhir")
+                channel_id = Config.CTA_ANNOUNCE_CHANNEL_ID if vis == "linhir" else Config.CTA_CONTENT_CHANNEL_ID
+                role_id = cta.get("discord_role_id")
 
-        if status != 200 or not result.get("success"):
-            return
-
-        ctas = result.get("ctas", [])
-        if not ctas:
-            return
-
-        logger.info("Recordatorios pendientes: %d", len(ctas))
-
-        for cta in ctas:
-            cta_id = cta["id"]
-            title = cta.get("title", "—")
-            location = cta.get("location", "—")
-            start_iso = cta.get("start_time")
-            participants = cta.get("confirmed_participants") or []
-
-            if not participants:
-                await APIClient.mark_reminder_sent(cta_id)
-                continue
-
-            start_fmt = start_iso
-            try:
-                start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                ts = int(start_dt.timestamp())
-                start_fmt = f"<t:{ts}:R>"
-            except (ValueError, TypeError, AttributeError):
-                pass
-
-            body = (
-                f"🔔 **Recordatorio de CTA**\n\n"
-                f"**{title}**\n"
-                f"📍 {location}\n"
-                f"⏰ Inicia {start_fmt}\n\n"
-                f"¡No olvides asistir!"
-            )
-
-            sent = 0
-            failed = 0
-            for p in participants:
-                uid = p.get("discord_user_id")
-                if not uid:
+                if not channel_id:
+                    logger.error("Falta canal configurado para visibilidad %s", vis)
                     continue
+
+                channel = self.bot.get_channel(channel_id)
+                if not channel: continue
+
+                embed = build_cta_embed(cta)
+                view = CtaAnnouncementView(cta_id=cta_id)
+                content = f"<@&{role_id}>" if role_id else None
+                allowed = discord.AllowedMentions(roles=True) if role_id else discord.AllowedMentions.none()
+
                 try:
-                    user = await self.bot.fetch_user(int(uid))
-                    await user.send(body)
-                    sent += 1
-                except (discord.Forbidden, discord.NotFound):
-                    failed += 1
-                except discord.HTTPException as exc:
-                    failed += 1
-                    logger.warning("DM fallo para %s: %s", uid, exc)
+                    msg = await channel.send(content=content, embed=embed, view=view, allowed_mentions=allowed)
+                    await APIClient.mark_announced(cta_id, str(msg.id), str(channel.id))
+                    logger.info("CTA #%s anunciada en #%s", cta_id, channel.name)
+                except Exception as exc:
+                    logger.error("Error publicando CTA #%s: %s", cta_id, exc)
+                
+                await asyncio.sleep(2) # Evitar rate limit
+        except Exception as exc:
+            logger.exception("Error en announcement_loop: %s", exc)
 
-            await APIClient.mark_reminder_sent(cta_id)
+    @tasks.loop(seconds=60)
+    async def voice_channel_loop(self):
+        """Crea canales de voz 10 min antes del inicio."""
+        try:
+            result, status = await APIClient.get_active_ctas()
+            if status != 200 or not result.get("success"): return
+            
+            now = datetime.now(timezone.utc)
+            for cta in result.get("ctas", []):
+                if cta.get("discord_voice_channel_id"): continue
+                
+                start_dt = datetime.fromisoformat(cta["start_time"].replace("Z", "+00:00"))
+                diff = (start_dt - now).total_seconds() / 60.0
 
-            logger.info(
-                "Recordatorio CTA #%s: %d enviados, %d fallidos",
-                cta_id, sent, failed,
+                if 0 <= diff <= 12:
+                    await self._create_voice_channel(cta)
+        except Exception as exc:
+            logger.exception("Error en voice_channel_loop: %s", exc)
+
+    @tasks.loop(minutes=1)
+    async def empty_channel_cleanup_loop(self):
+        """Borra canales de voz vacíos."""
+        try:
+            result, status = await APIClient.get_active_ctas()
+            if status != 200 or not result.get("success"): return
+            
+            for cta in result.get("ctas", []):
+                vc_id = cta.get("discord_voice_channel_id")
+                if not vc_id: continue
+                
+                channel = self.bot.get_channel(int(vc_id))
+                if channel and len([m for m in channel.members if not m.bot]) == 0:
+                    try:
+                        await channel.delete(reason="Canal vacío")
+                        logger.info("Canal de voz %s eliminado", vc_id)
+                    except discord.HTTPException as exc:
+                        logger.warning("No se pudo borrar %s: %s", vc_id, exc)
+        except Exception as exc:
+            logger.exception("Error en empty_channel_cleanup_loop: %s", exc)
+
+    async def _create_voice_channel(self, cta: dict):
+        cta_id = cta["id"]
+        vis = cta.get("visibility", "linhir")
+        guild = self.bot.guilds[0] if self.bot.guilds else None
+        if not guild: return
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(connect=False),
+            guild.me: discord.PermissionOverwrite(connect=True, manage_channels=True)
+        }
+        
+        role_id = Config.HRL_ROLE_ID if vis == "alliance" else Config.LINHIR_ROLE_ID
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(connect=True)
+
+        try:
+            vc = await guild.create_voice_channel(
+                name=f"🔊 {cta.get('title', 'CTA')[:20]}",
+                overwrites=overwrites,
+                reason=f"Canal para CTA #{cta_id}"
             )
+            await APIClient.update_voice_channel(cta_id, str(vc.id))
+            logger.info("Canal de voz %s creado para CTA #%s", vc.id, cta_id)
+        except Exception as exc:
+            logger.error("Error creando canal de voz: %s", exc)
+
+    # ================================================================== #
+    #                 LISTENER: ENTRADA/SALIDA DE VOZ                    #
+    # ================================================================== #
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        if member.bot: return
+
+        # SALIÓ
+        if before.channel and not after.channel:
+            cta_id = await self._get_cta_id_by_voice_channel(before.channel.id)
+            if cta_id:
+                join_time = VOICE_SESSIONS.get(cta_id, {}).pop(member.id, None)
+                if join_time:
+                    seconds = int((datetime.now(timezone.utc) - join_time).total_seconds())
+                    if seconds > 0:
+                        await APIClient.add_voice_time(cta_id, str(member.id), seconds)
+
+        # ENTRÓ
+        elif not before.channel and after.channel:
+            cta_id = await self._get_cta_id_by_voice_channel(after.channel.id)
+            if cta_id:
+                if cta_id not in VOICE_SESSIONS: VOICE_SESSIONS[cta_id] = {}
+                VOICE_SESSIONS[cta_id][member.id] = datetime.now(timezone.utc)
+
+                try:
+                    result, status = await APIClient.get_cta(cta_id)
+                    if status == 200 and result.get("success"):
+                        parts = result["cta"].get("participants", [])
+                        is_enrolled = any(str(p.get("discord_user_id")) == str(member.id) and p.get("status") == "confirmed" for p in parts)
+                        
+                        if not is_enrolled:
+                            msg = await after.channel.send(
+                                f"👋 {member.mention}, veo que has entrado al canal. ¿Participas o estás de espectador?\n"
+                                f"*(Usa `/cta unirse {cta_id}` si deseas participar)*"
+                            )
+                            await asyncio.sleep(30)
+                            try: await msg.delete()
+                            except Exception: pass
+                except Exception as exc:
+                    logger.error("Error consultando CTA en voz: %s", exc)
+
+    async def _get_cta_id_by_voice_channel(self, voice_channel_id: int) -> int | None:
+        try:
+            result, status = await APIClient.get_active_ctas()
+            if status == 200 and result.get("success"):
+                for cta in result["ctas"]:
+                    if str(cta.get("discord_voice_channel_id")) == str(voice_channel_id):
+                        return cta["id"]
+        except Exception:
+            pass
+        return None
+    
 
     # ================================================================== #
     #                    Grupo: /cta                                      #
@@ -816,78 +949,43 @@ class CtasCog(commands.Cog):
 
     # ------------------- /cta crear -------------------
 
-    @cta_group.command(
-        name="crear",
-        description="[Oficiales] Crea una nueva CTA con anuncio y evento de Discord",
-    )
+    @cta_group.command(name="crear", description="[Oficiales] Crea una nueva CTA")
     @app_commands.describe(
-        composicion="Composición a usar (autocompletado)",
-        titulo="Título de la CTA",
-        ubicacion="Ubicación (ej: 'Black Zone Portal Rojo')",
-        inicio="Inicio en DD/MM/YYYY HH:MM (UTC)",
-        fin="Fin en DD/MM/YYYY HH:MM (UTC)",
-        recordatorio="Minutos antes para DM de recordatorio (default 10)",
-        mencionar="Rol a mencionar en el anuncio (opcional)",
+        composicion="Composición a usar", titulo="Título de la CTA", ubicacion="Ubicación",
+        inicio="Inicio en DD/MM/YYYY HH:MM (UTC)", fin="Fin en DD/MM/YYYY HH:MM (UTC)",
+        visibilidad="¿Para quién es la actividad?", loot_type="¿Cómo se repartirá el botín?",
+        recordatorio="Minutos antes para DM (default 10)",
+    )
+    @app_commands.choices(
+        visibilidad=[
+            app_commands.Choice(name="Solo Linhir", value="linhir"),
+            app_commands.Choice(name="Alianza HRL", value="alliance"),
+        ],
+        loot_type=[
+            app_commands.Choice(name="Split con Impuesto (15%)", value="taxed_split"),
+            app_commands.Choice(name="Full Split (Sin impuestos)", value="full_split"),
+            app_commands.Choice(name="Pro-Gremio (Todo al banco)", value="pro_guild"),
+        ]
     )
     @app_commands.autocomplete(composicion=composition_autocomplete)
     async def crear(
-        self,
-        interaction: discord.Interaction,
-        composicion: str,
-        titulo: str,
-        ubicacion: str,
-        inicio: str,
-        fin: str,
+        self, interaction: discord.Interaction, composicion: str, titulo: str,
+        ubicacion: str, inicio: str, fin: str,
+        visibilidad: app_commands.Choice[str], loot_type: app_commands.Choice[str],
         recordatorio: int = 10,
-        mencionar: discord.Role | None = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         if not await is_officer(interaction):
-            await interaction.followup.send(
-                "❌ Solo oficiales pueden crear CTAs.", ephemeral=True
-            )
-            return
-
-        if not Config.CTA_ANNOUNCE_CHANNEL_ID:
-            await interaction.followup.send(
-                "❌ Falta configurar `CTA_ANNOUNCE_CHANNEL_ID` en el `.env`.",
-                ephemeral=True,
-            )
-            return
-
-        channel = interaction.guild.get_channel(Config.CTA_ANNOUNCE_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send(
-                "❌ El canal de anuncios de CTAs no es válido.", ephemeral=True
-            )
-            return
+            return await interaction.followup.send("❌ Solo oficiales.", ephemeral=True)
 
         start_iso, err = parse_datetime(inicio)
-        if err:
-            await interaction.followup.send(f"❌ Inicio: {err}", ephemeral=True)
-            return
-
+        if err: return await interaction.followup.send(f"❌ Inicio: {err}", ephemeral=True)
         end_iso, err = parse_datetime(fin)
-        if err:
-            await interaction.followup.send(f"❌ Fin: {err}", ephemeral=True)
-            return
+        if err: return await interaction.followup.send(f"❌ Fin: {err}", ephemeral=True)
 
-        if end_iso <= start_iso:
-            await interaction.followup.send(
-                "❌ La hora de fin debe ser posterior al inicio.", ephemeral=True
-            )
-            return
-
-        try:
-            composition_id = int(composicion)
-        except (ValueError, TypeError):
-            await interaction.followup.send(
-                "❌ Composición inválida. Usa el autocompletado.", ephemeral=True
-            )
-            return
-
-        recordatorio = max(1, min(120, recordatorio))
+        loot_val = loot_type.value
+        if visibilidad.value == "alliance": loot_val = "full_split"
 
         # 1. Crear evento de Discord
         discord_event_id = None
@@ -897,608 +995,250 @@ class CtasCog(commands.Cog):
             event = await interaction.guild.create_scheduled_event(
                 name=f"⚔️ {titulo}"[:100],
                 description=f"CTA de {Config.GUILD_NAME}. Ubicación: {ubicacion}"[:1000],
-                start_time=start_dt,
-                end_time=end_dt,
-                entity_type=discord.EntityType.external,
-                privacy_level=discord.PrivacyLevel.guild_only,
-                location=ubicacion[:100],
-                reason=f"CTA creada por {interaction.user}",
+                start_time=start_dt, end_time=end_dt,
+                entity_type=discord.EntityType.external, privacy_level=discord.PrivacyLevel.guild_only,
+                location=ubicacion[:100], reason=f"CTA creada por {interaction.user}",
             )
             discord_event_id = str(event.id)
-        except discord.Forbidden:
-            logger.warning("Sin permiso Manage Events; se omite evento de Discord")
         except Exception as exc:
-            logger.exception("Error creando evento: %s", exc)
+            logger.warning("No se pudo crear evento de Discord: %s", exc)
 
-        # 2. Enviar mensaje placeholder SIN vista
-        placeholder_embed = discord.Embed(
-            title=f"⚔️ {titulo}",
-            description=f"📍 **{ubicacion}**\n⏳ Publicando...",
-            color=Config.EMBED_COLOR,
-        )
-
-        content = mencionar.mention if mencionar else None
-        allowed = (
-            discord.AllowedMentions(roles=[mencionar])
-            if mencionar
-            else discord.AllowedMentions.none()
-        )
-
-        msg = await channel.send(
-            content=content,
-            embed=placeholder_embed,
-            allowed_mentions=allowed,
-        )
-
-        # 3. Registrar en el backend
         payload = {
-            "composition_id":        composition_id,
+            "composition_id":        int(composicion),
             "title":                 titulo[:120],
             "location":              ubicacion[:120],
+            "visibility":            visibilidad.value,
+            "loot_type":             loot_val,
             "start_time":            start_iso,
             "end_time":              end_iso,
-            "reminder_minutes":      recordatorio,
-            "discord_message_id":    str(msg.id),
-            "discord_channel_id":    str(channel.id),
+            "reminder_minutes":      max(1, min(120, recordatorio)),
             "discord_event_id":      discord_event_id,
-            "discord_role_id":       str(mencionar.id) if mencionar else None,
             "created_by_discord_id": str(interaction.user.id),
             "created_by_name":       interaction.user.display_name,
+            "announced":             False, # Se anunciará después
         }
-        payload = {k: v for k, v in payload.items() if v is not None}
-
+        
         try:
             result, status = await APIClient.create_cta(payload)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            if discord_event_id:
-                try:
-                    ev = await interaction.guild.fetch_scheduled_event(int(discord_event_id))
-                    await ev.delete(reason="Rollback por error al registrar CTA")
-                except Exception:
-                    pass
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo registrar la CTA.')}",
-                ephemeral=True,
+            if status != 200 or not result.get("success"):
+                return await interaction.followup.send(f"❌ {result.get('reason')}", ephemeral=True)
+            
+            cta_id = result["cta_id"]
+            
+            # 2. Preguntar cuándo anunciar
+            embed = discord.Embed(
+                title="📅 CTA Creada Exitosamente",
+                description="¿Cuándo deseas que se envíe el anuncio (Ping) a Discord?",
+                color=Config.EMBED_COLOR
             )
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            if discord_event_id:
-                try:
-                    ev = await interaction.guild.fetch_scheduled_event(int(discord_event_id))
-                    await ev.delete(reason="Rollback por error al registrar CTA")
-                except Exception:
-                    pass
-            return
+            ch_id = Config.CTA_ANNOUNCE_CHANNEL_ID if visibilidad.value == "linhir" else Config.CTA_CONTENT_CHANNEL_ID
+            role_id = Config.LINHIR_ROLE_ID if visibilidad.value == "linhir" else Config.HRL_ROLE_ID
+            
+            view = AnnouncementTimeView(cta_id, ch_id, role_id, interaction.user.id)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-        cta_id = result["cta_id"]
-
-        # 4. Actualizar mensaje con embed real + vista visual
-        try:
-            cta_result, cta_status = await APIClient.get_cta(cta_id)
-            if cta_status == 200 and cta_result.get("success"):
-                real_embed = build_cta_embed(cta_result["cta"])
-                real_view = CtaAnnouncementView(cta_id=cta_id)
-                await msg.edit(embed=real_embed, view=real_view)
         except Exception as exc:
-            logger.warning("No se pudo refrescar el mensaje con datos reales: %s", exc)
-
-        await interaction.followup.send(
-            f"✅ CTA **#{cta_id}** creada y publicada en {channel.mention}.",
-            ephemeral=True,
-        )
-        logger.info(
-            "CTA #%s creada por %s (composición=%s, evento=%s)",
-            cta_id, interaction.user, composition_id, discord_event_id,
-        )
+            logger.error("Error creando CTA: %s", exc)
+            await interaction.followup.send("❌ Error de conexión.", ephemeral=True)
 
     # ------------------- /cta unirse -------------------
 
-    @cta_group.command(
-        name="unirse",
-        description="Únete a una CTA eligiendo un arma libre",
-    )
-    @app_commands.describe(cta_id="ID de la CTA (ver /ctas)")
+    @cta_group.command(name="unirse", description="Únete a una CTA eligiendo un arma libre")
+    @app_commands.describe(cta_id="ID de la CTA")
     async def unirse(self, interaction: discord.Interaction, cta_id: int):
         await interaction.response.defer(ephemeral=True, thinking=True)
-
         try:
             result, status = await APIClient.get_cta(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if status != 200 or not result.get("success"):
+                return await interaction.followup.send("❌ CTA no encontrada.", ephemeral=True)
+            
+            cta = result["cta"]
+            if cta.get("status") != "scheduled":
+                return await interaction.followup.send("❌ CTA inactiva.", ephemeral=True)
 
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'CTA no encontrada.')}", ephemeral=True
-            )
-            return
+            weapons = (cta.get("composition") or {}).get("weapons") or []
+            occupancy = {str(p["composition_weapon_id"]): p["user_name"] for p in cta.get("participants") or [] if p.get("status") == "confirmed" and p.get("composition_weapon_id")}
 
-        cta = result["cta"]
-        if cta.get("status") != "scheduled":
-            await interaction.followup.send(
-                "❌ Esta CTA ya no está activa.", ephemeral=True
-            )
-            return
-
-        composition = cta.get("composition") or {}
-        weapons = composition.get("weapons") or []
-        occupancy = {}
-        for p in cta.get("participants") or []:
-            if p.get("status") == "confirmed" and p.get("composition_weapon_id"):
-                occupancy[str(p["composition_weapon_id"])] = p["user_name"]
-
-        if not weapons:
-            await interaction.followup.send(
-                "⚠️ Esta CTA no tiene composición con armas.", ephemeral=True
-            )
-            return
-
-        msg_id_raw = cta.get("discord_message_id")
-        ch_id_raw = cta.get("discord_channel_id")
-        try:
+            msg_id_raw = cta.get("discord_message_id")
+            ch_id_raw = cta.get("discord_channel_id")
             msg_id = int(msg_id_raw) if msg_id_raw else 0
             ch_id = int(ch_id_raw) if ch_id_raw else interaction.channel_id
-        except (ValueError, TypeError):
-            msg_id = 0
-            ch_id = interaction.channel_id
 
-        view = WeaponSelectView(
-            cta_id=cta_id,
-            weapons=weapons,
-            occupancy=occupancy,
-            author_id=interaction.user.id,
-            channel_id=ch_id,
-            message_id=msg_id,
-        )
-        view.bot = interaction.client
-
-        await interaction.followup.send(
-            "Selecciona el arma con la que participarás:",
-            view=view,
-            ephemeral=True,
-        )
+            view = WeaponSelectView(cta_id, weapons, occupancy, interaction.user.id, ch_id, msg_id)
+            view.bot = interaction.client
+            await interaction.followup.send("Selecciona tu arma:", view=view, ephemeral=True)
+        except Exception as exc:
+            logger.error("Error en /cta unirse: %s", exc)
 
     # ------------------- /cta ausente -------------------
 
-    @cta_group.command(
-        name="ausente",
-        description="Marca tu ausencia en una CTA y libera tu arma",
-    )
+    @cta_group.command(name="ausente", description="Marca tu ausencia en una CTA y libera tu arma")
     @app_commands.describe(cta_id="ID de la CTA")
     async def ausente(self, interaction: discord.Interaction, cta_id: int):
         await interaction.response.defer(ephemeral=True, thinking=True)
-
         try:
-            result, status = await APIClient.cta_absent(
-                cta_id, str(interaction.user.id)
-            )
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo registrar tu ausencia.')}",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.followup.send(
-            f"🚫 Marcado como ausente en la CTA **#{cta_id}**.", ephemeral=True
-        )
+            result, status = await APIClient.cta_absent(cta_id, str(interaction.user.id))
+            if status == 200 and result.get("success"):
+                await interaction.followup.send(f"🚫 Marcado como ausente en la CTA **#{cta_id}**.", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ {result.get('reason', 'Error.')}", ephemeral=True)
+        except Exception as exc:
+            logger.error("Error en /cta ausente: %s", exc)
 
     # ------------------- /cta cancelar -------------------
 
-    @cta_group.command(
-        name="cancelar",
-        description="[Oficiales] Cancela una CTA, elimina su evento de Discord y notifica a los inscritos",
-    )
-    @app_commands.describe(
-        cta_id="ID de la CTA a cancelar",
-        motivo="Motivo de la cancelación (se enviará a los inscritos)",
-        notificar="Enviar DM a los inscritos (default: sí)",
-    )
-    async def cancelar(
-        self,
-        interaction: discord.Interaction,
-        cta_id: int,
-        motivo: str = "Cancelada por un oficial",
-        notificar: bool = True,
-    ):
+    @cta_group.command(name="cancelar", description="[Oficiales] Cancela una CTA, elimina evento y notifica")
+    @app_commands.describe(cta_id="ID de la CTA", motivo="Motivo de cancelación", notificar="¿Enviar DM a inscritos?")
+    async def cancelar(self, interaction: discord.Interaction, cta_id: int, motivo: str = "Cancelada por un oficial", notificar: bool = True):
         await interaction.response.defer(ephemeral=True, thinking=True)
-
-        if not await is_officer(interaction):
-            await interaction.followup.send(
-                "❌ Solo oficiales pueden cancelar CTAs.", ephemeral=True
-            )
-            return
+        if not await is_officer(interaction): return await interaction.followup.send("❌ Solo oficiales.", ephemeral=True)
 
         try:
             pre_result, pre_status = await APIClient.get_cta(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if pre_status != 200 or not pre_result.get("success"):
+                return await interaction.followup.send("❌ CTA no encontrada.", ephemeral=True)
+            
+            cta_before = pre_result["cta"]
+            if cta_before.get("status") != "scheduled":
+                return await interaction.followup.send(f"⚠️ Ya está {cta_before.get('status')}.", ephemeral=True)
 
-        if pre_status != 200 or not pre_result.get("success"):
-            await interaction.followup.send(
-                f"❌ {pre_result.get('reason', 'CTA no encontrada.')}", ephemeral=True
-            )
-            return
-
-        cta_before = pre_result["cta"]
-
-        if cta_before.get("status") != "scheduled":
-            await interaction.followup.send(
-                f"⚠️ Esta CTA ya está **{cta_before.get('status')}**. "
-                f"No hay nada que cancelar.",
-                ephemeral=True,
-            )
-            return
-
-        participants = [
-            p for p in (cta_before.get("participants") or [])
-            if p.get("status") == "confirmed" and p.get("discord_user_id")
-        ]
-        cta_title = cta_before.get("title", "—")
-
-        try:
+            participants = [p for p in (cta_before.get("participants") or []) if p.get("status") == "confirmed" and p.get("discord_user_id")]
+            
             result, status = await APIClient.cta_cancel(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if status != 200 or not result.get("success"):
+                return await interaction.followup.send("❌ Error al cancelar.", ephemeral=True)
 
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'No se pudo cancelar.')}", ephemeral=True
-            )
-            return
+            # Eliminar evento
+            event_id = cta_before.get("discord_event_id")
+            event_status = "sin evento"
+            if event_id:
+                try:
+                    event = await interaction.guild.fetch_scheduled_event(int(event_id))
+                    await event.delete(reason="CTA cancelada")
+                    event_status = "evento eliminado"
+                except Exception as exc:
+                    event_status = "error al eliminar evento"
+                    logger.warning("Evento no borrado: %s", exc)
 
-        # Eliminar evento de Discord
-        event_id = cta_before.get("discord_event_id")
-        event_status = "sin evento vinculado"
-
-        if event_id:
-            try:
-                event = await interaction.guild.fetch_scheduled_event(int(event_id))
-                event_name = event.name
-                await event.delete(reason=f"CTA cancelada por {interaction.user}")
-                event_status = f"evento `{event_name}` eliminado"
-                logger.info(
-                    "Evento de Discord %s eliminado para CTA #%s", event_id, cta_id
-                )
-            except discord.NotFound:
-                event_status = "evento ya no existía en Discord"
-                logger.warning(
-                    "Evento %s no encontrado para CTA #%s (quizá ya fue eliminado)",
-                    event_id, cta_id,
-                )
-            except discord.Forbidden:
-                event_status = "⚠️ sin permisos para eliminar el evento"
-                logger.error(
-                    "Sin permisos para eliminar evento %s (CTA #%s)", event_id, cta_id
-                )
-            except discord.HTTPException as exc:
-                event_status = f"⚠️ error HTTP ({exc.status}) al eliminar el evento"
-                logger.exception("Error HTTP eliminando evento %s: %s", event_id, exc)
-
-        # Actualizar mensaje público
-        try:
-            cta_result, cta_status = await APIClient.get_cta(cta_id)
-            if cta_status == 200 and cta_result.get("success"):
-                cta = cta_result["cta"]
+            # Actualizar embed público
+            cta_res, _ = await APIClient.get_cta(cta_id)
+            if cta_res and cta_res.get("success"):
+                cta = cta_res["cta"]
                 msg_id = cta.get("discord_message_id")
                 ch_id = cta.get("discord_channel_id")
                 if msg_id and ch_id:
                     channel = self.bot.get_channel(int(ch_id))
                     if channel:
                         msg = await channel.fetch_message(int(msg_id))
-                        new_embed = build_cta_embed(cta)
+                        view = CtaAnnouncementView(cta_id)
+                        for c in view.children: c.disabled = True
+                        await msg.edit(embed=build_cta_embed(cta), view=view)
 
-                        view = CtaAnnouncementView(cta_id=cta_id)
-                        for c in view.children:
-                            c.disabled = True
+            # Notificar
+            notified = 0
+            if notificar and participants:
+                body = f"⚠️ **CTA cancelada**\n\n**{cta_before.get('title')}**\nMotivo: {motivo[:200]}"
+                for p in participants:
+                    try:
+                        user = await self.bot.fetch_user(int(p["discord_user_id"]))
+                        await user.send(body)
+                        notified += 1
+                    except Exception: pass
 
-                        await msg.edit(embed=new_embed, view=view)
+            await interaction.followup.send(
+                f"✅ CTA #{cta_id} cancelada.\n📅 {event_status}\n📩 Notificados: {notified}/{len(participants)}",
+                ephemeral=True
+            )
         except Exception as exc:
-            logger.warning("No se pudo actualizar mensaje de CTA cancelada: %s", exc)
-
-        # Notificar por DM
-        notified = 0
-        failed_notify = 0
-
-        if notificar and participants:
-            dm_body = (
-                f"⚠️ **CTA cancelada**\n\n"
-                f"**{cta_title}**\n"
-                f"Motivo: {motivo[:200]}\n\n"
-                f"Disculpa las molestias."
-            )
-            for p in participants:
-                try:
-                    user = await self.bot.fetch_user(int(p["discord_user_id"]))
-                    await user.send(dm_body)
-                    notified += 1
-                except (discord.Forbidden, discord.NotFound):
-                    failed_notify += 1
-                except discord.HTTPException as exc:
-                    failed_notify += 1
-                    logger.warning("DM fallo al notificar cancelación: %s", exc)
-
-        summary_lines = [
-            f"✅ CTA **#{cta_id}** cancelada.",
-            f"📅 Evento: {event_status}",
-        ]
-        if notificar and participants:
-            summary_lines.append(
-                f"📩 Notificados: {notified}/{len(participants)}"
-                + (f" ({failed_notify} fallidos)" if failed_notify else "")
-            )
-        elif notificar and not participants:
-            summary_lines.append("📩 Sin inscritos a notificar")
-
-        await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
-
-        logger.info(
-            "CTA #%s cancelada por %s | evento=%s | notificados=%d/%d",
-            cta_id, interaction.user, event_status, notified, len(participants),
-        )
+            logger.error("Error en /cta cancelar: %s", exc)
 
     # ------------------- /cta pagar -------------------
 
-    @cta_group.command(
-        name="pagar",
-        description="[Oficiales] Paga una CTA y distribuye el botín entre sus participantes",
-    )
+    @cta_group.command(name="pagar", description="[Oficiales] Paga una CTA y distribuye el botín")
     @app_commands.describe(
-        cta_id="ID de la CTA a pagar (ver /ctas)",
-        silver="Silver líquido recolectado",
-        items="Valor estimado de los items (opcional)",
-        pro_gremio="Si es True, TODO el botín va al gremio (sin repartir)",
+        cta_id="ID de la CTA", silver="Silver líquido", items="Valor estimado de items",
+        loot_type="Tipo de reparto final"
     )
-    async def pagar(
-        self,
-        interaction: discord.Interaction,
-        cta_id: int,
-        silver: int,
-        items: int = 0,
-        pro_gremio: bool = False,
-    ):
+    @app_commands.choices(loot_type=[
+        app_commands.Choice(name="Split con Impuesto (15%)", value="taxed_split"),
+        app_commands.Choice(name="Full Split (Sin impuestos)", value="full_split"),
+        app_commands.Choice(name="Pro-Gremio (Todo al banco)", value="pro_guild"),
+    ])
+    async def pagar(self, interaction: discord.Interaction, cta_id: int, silver: int, items: int = 0, loot_type: app_commands.Choice[str] = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await is_officer(interaction): return await interaction.followup.send("❌ Solo oficiales.", ephemeral=True)
+        if silver < 0 or items < 0: return await interaction.followup.send("❌ Montos negativos.", ephemeral=True)
 
-        if not await is_officer(interaction):
-            await interaction.followup.send(
-                "❌ Solo oficiales pueden pagar CTAs.", ephemeral=True
-            )
-            return
-
-        if silver < 0 or items < 0:
-            await interaction.followup.send(
-                "❌ Los montos no pueden ser negativos.", ephemeral=True
-            )
-            return
-
-        # ------------------------------------------------------------------
-        # 1. Cargar la CTA
-        # ------------------------------------------------------------------
         try:
             result, status = await APIClient.get_cta(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
-
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'CTA no encontrada.')}", ephemeral=True
-            )
-            return
-
-        cta = result["cta"]
-
-        if cta.get("paid"):
-            await interaction.followup.send(
-                f"⚠️ La CTA **#{cta_id}** ya fue pagada.", ephemeral=True
-            )
-            return
-        if cta.get("status") == "cancelled":
-            await interaction.followup.send(
-                f"⚠️ La CTA **#{cta_id}** está cancelada. No se puede pagar.",
-                ephemeral=True,
-            )
-            return
-
-        # ------------------------------------------------------------------
-        # 2. Modo pro-gremio
-        # ------------------------------------------------------------------
-        if pro_gremio:
-            payload = {
-                "cta_id":                    cta_id,
-                "name":                      cta.get("title", f"CTA #{cta_id}"),
-                "start_time":                cta["start_time"],
-                "end_time":                  cta["end_time"],
-                "liquid_silver":             int(silver),
-                "items_value":               int(items),
-                "pro_guild":                 True,
-                "participants":              [],
-                "registered_by_discord_id":  str(interaction.user.id),
-                "registered_by_name":        interaction.user.display_name,
-            }
-
-            try:
+            if status != 200: return await interaction.followup.send("❌ CTA no encontrada.", ephemeral=True)
+            cta = result["cta"]
+            if cta.get("paid"): return await interaction.followup.send("⚠️ Ya está pagada.", ephemeral=True)
+            
+            loot_val = loot_type.value if loot_type else cta.get("loot_type", "taxed_split")
+            if cta.get("visibility") == "alliance": loot_val = "full_split"
+            
+            if loot_val == "pro_guild":
+                payload = {
+                    "cta_id": cta_id, "name": cta.get("title"), "start_time": cta["start_time"], "end_time": cta["end_time"],
+                    "liquid_silver": silver, "items_value": items, "pro_guild": True, "loot_type": "pro_guild",
+                    "participants": [], "registered_by_discord_id": str(interaction.user.id), "registered_by_name": interaction.user.display_name
+                }
                 r, s = await APIClient.create_activity(payload)
-            except (AuthenticationError, AuthorizationError) as exc:
-                await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
+                if s == 200 and r.get("success"):
+                    embed = discord.Embed(title="✅ Pago Pro-Gremio registrado", description=f"Total: `{format_number(silver+items)}`", color=Config.EMBED_COLOR)
+                    await interaction.followup.send(embed=embed)
+                else:
+                    await interaction.followup.send(f"❌ {r.get('reason')}")
                 return
 
-            if s != 200 or not r.get("success"):
-                await interaction.followup.send(
-                    f"❌ {r.get('reason', 'No se pudo registrar.')}",
-                    ephemeral=True,
-                )
-                return
+            members_data, m_status = await APIClient.get_registered_members()
+            personajes = [{"name": p["name"], "discord_user_id": str(p["discord_user_id"])} for p in members_data.get("guild_registered", [])]
+            personajes_by_uid = {p["discord_user_id"]: p["name"] for p in personajes}
 
-            total_bruto = int(silver) + int(items)
-            embed = discord.Embed(
-                title="✅ CTA pagada como pro-gremio",
-                description=(
-                    f"**{cta.get('title', f'CTA #{cta_id}')}**\n\n"
-                    f"Silver: `{format_number(silver)}`\n"
-                    f"Items: `{format_number(items)}`\n"
-                    f"**Total al gremio:** `{format_number(total_bruto)}` plata"
-                ),
-                color=Config.EMBED_COLOR,
-            )
-            embed.set_footer(text=f"CTA #{cta_id} marcada como pagada")
-            await interaction.followup.send(embed=embed)
-            return
+            confirmed = [p for p in cta.get("participants", []) if p.get("status") == "confirmed"]
+            preseed = [{"discord_user_id": str(p["discord_user_id"]), "name": personajes_by_uid[str(p["discord_user_id"])], "percent": 100} for p in confirmed if str(p.get("discord_user_id")) in personajes_by_uid]
 
-        # ------------------------------------------------------------------
-        # 3. Modo normal → precargar participantes
-        # ------------------------------------------------------------------
-        try:
-            members_data, members_status = await APIClient.get_registered_members()
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if not preseed: return await interaction.followup.send("⚠️ Ningún participante está vinculado.", ephemeral=True)
 
-        if members_status != 200 or not members_data.get("success"):
-            await interaction.followup.send(
-                "❌ No se pudo cargar la lista de miembros.", ephemeral=True
-            )
-            return
-
-        guild_registered = members_data.get("guild_registered", [])
-        personajes = [
-            {
-                "name":            p["name"],
-                "discord_user_id": str(p["discord_user_id"]),
+            from cogs.activities import ActivityBuilderView
+            base_payload = {
+                "cta_id": cta_id, "name": cta.get("title"), "start_time": cta["start_time"], "end_time": cta["end_time"],
+                "liquid_silver": silver, "items_value": items, "pro_guild": False, "loot_type": loot_val,
+                "registered_by_discord_id": str(interaction.user.id), "registered_by_name": interaction.user.display_name
             }
-            for p in guild_registered
-        ]
-        personajes_by_uid = {p["discord_user_id"]: p["name"] for p in personajes}
-
-        confirmed = [
-            p for p in (cta.get("participants") or [])
-            if p.get("status") == "confirmed"
-        ]
-
-        if not confirmed:
-            await interaction.followup.send(
-                f"⚠️ La CTA **#{cta_id}** no tiene participantes confirmados.",
-                ephemeral=True,
+            
+            view = ActivityBuilderView(interaction.user.id, base_payload, personajes, preseed)
+            panel = await interaction.channel.send(
+                content=f"💰 **Pago de CTA #{cta_id} ({loot_val})**\nParticipantes precargados: {len(preseed)}",
+                embed=view.build_embed(), view=view
             )
-            return
+            view.message = panel
+            await interaction.followup.send("✅ Panel abierto.", ephemeral=True)
 
-        preseed = []
-        sin_personaje = []
-        for p in confirmed:
-            uid = str(p.get("discord_user_id", ""))
-            if uid in personajes_by_uid:
-                preseed.append({
-                    "discord_user_id": uid,
-                    "name":            personajes_by_uid[uid],
-                    "percent":         100,
-                })
-            else:
-                sin_personaje.append(p.get("user_name", "—"))
-
-        if not preseed:
-            await interaction.followup.send(
-                "⚠️ Ninguno de los participantes de la CTA tiene personaje "
-                "vinculado en el gremio. No se puede distribuir.",
-                ephemeral=True,
-            )
-            return
-
-        # Import local para evitar circular imports (activities ↔ ctas)
-        from cogs.activities import ActivityBuilderView
-
-        base_payload = {
-            "cta_id":                    cta_id,
-            "name":                      cta.get("title", f"CTA #{cta_id}"),
-            "start_time":                cta["start_time"],
-            "end_time":                  cta["end_time"],
-            "liquid_silver":             int(silver),
-            "items_value":               int(items),
-            "pro_guild":                 False,
-            "registered_by_discord_id":  str(interaction.user.id),
-            "registered_by_name":        interaction.user.display_name,
-        }
-
-        view = ActivityBuilderView(
-            author_id=interaction.user.id,
-            base_payload=base_payload,
-            personajes=personajes,
-            preseed_participants=preseed,
-        )
-
-        panel_msg = await interaction.channel.send(
-            content=(
-                f"💰 **Pago de CTA #{cta_id}** · {cta.get('title', '')}\n"
-                f"Participantes precargados: **{len(preseed)}**\n"
-                f"*(Revisa la lista, quita a quien no asistió, ajusta % y confirma)*"
-            ),
-            embed=view.build_embed(),
-            view=view,
-        )
-        view.message = panel_msg
-
-        if sin_personaje:
-            await interaction.followup.send(
-                f"⚠️ **Sin personaje vinculado** (no se incluyen):\n"
-                + "\n".join(f"• {n}" for n in sin_personaje[:10]),
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                f"✅ Panel de pago abierto para la CTA **#{cta_id}**.",
-                ephemeral=True,
-            )
+        except Exception as exc:
+            logger.error("Error en /cta pagar: %s", exc)
 
     # ------------------- /cta ver -------------------
 
-    @cta_group.command(
-        name="ver",
-        description="Muestra el detalle completo de una CTA",
-    )
+    @cta_group.command(name="ver", description="Muestra el detalle completo de una CTA")
     @app_commands.describe(cta_id="ID de la CTA")
     async def ver(self, interaction: discord.Interaction, cta_id: int):
         await interaction.response.defer(thinking=True)
-
         try:
             result, status = await APIClient.get_cta(cta_id)
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if status == 200 and result.get("success"):
+                embed = build_cta_embed(result["cta"])
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send("❌ CTA no encontrada.", ephemeral=True)
+        except Exception as exc:
+            logger.error("Error en /cta ver: %s", exc)
 
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                f"❌ {result.get('reason', 'CTA no encontrada.')}", ephemeral=True
-            )
-            return
+    # ------------------- /ctas -------------------
 
-        embed = build_cta_embed(result["cta"])
-        await interaction.followup.send(embed=embed)
-
-    # ------------------- /ctas (lista con filtros) -------------------
-
-    @app_commands.command(
-        name="ctas",
-        description="Lista CTAs por estado (programadas, por pagar, pagadas, canceladas)",
-    )
-    @app_commands.describe(
-        filtro="Qué CTAs listar (default: programadas)",
-        limite="Cuántas mostrar (5-25)",
-    )
+    @app_commands.command(name="ctas", description="Lista CTAs por estado")
+    @app_commands.describe(filtro="Qué CTAs listar", limite="Cuántas mostrar (5-25)")
     @app_commands.choices(filtro=[
         app_commands.Choice(name="⚔️  Programadas",  value="scheduled"),
         app_commands.Choice(name="💰  Por pagar",    value="por_pagar"),
@@ -1506,137 +1246,76 @@ class CtasCog(commands.Cog):
         app_commands.Choice(name="❌  Canceladas",   value="cancelled"),
         app_commands.Choice(name="📜  Todas",        value="all"),
     ])
-    async def listar(
-        self,
-        interaction: discord.Interaction,
-        filtro: app_commands.Choice[str] | None = None,
-        limite: int = 15,
-    ):
+    async def listar(self, interaction: discord.Interaction, filtro: app_commands.Choice[str] | None = None, limite: int = 15):
         await interaction.response.defer(thinking=True)
-
         limite = max(5, min(25, limite))
         filtro_val = filtro.value if filtro else "scheduled"
 
         try:
             if filtro_val == "scheduled":
-                result, status = await APIClient.get_ctas(
-                    status="scheduled", paid=False, limit=limite
-                )
-                titulo = "⚔️ CTAs programadas"
-                subtitulo = "Próximas actividades sin pagar"
-
+                result, status = await APIClient.get_ctas(status="scheduled", paid=False, limit=limite)
+                titulo, subtitulo = "⚔️ CTAs programadas", "Próximas actividades sin pagar"
             elif filtro_val == "por_pagar":
                 result, status = await APIClient.get_pending_payment_ctas()
-                titulo = "💰 CTAs por pagar"
-                subtitulo = "Actividades pasadas pendientes de pago"
-                if result.get("ctas"):
-                    result["ctas"] = result["ctas"][:limite]
-
+                titulo, subtitulo = "💰 CTAs por pagar", "Actividades pasadas pendientes de pago"
+                if result.get("ctas"): result["ctas"] = result["ctas"][:limite]
             elif filtro_val == "pagadas":
-                result, status = await APIClient.get_ctas(
-                    paid=True, limit=limite
-                )
-                titulo = "✅ CTAs pagadas"
-                subtitulo = "Últimas actividades liquidadas"
-
+                result, status = await APIClient.get_ctas(paid=True, limit=limite)
+                titulo, subtitulo = "✅ CTAs pagadas", "Últimas actividades liquidadas"
             elif filtro_val == "cancelled":
-                result, status = await APIClient.get_ctas(
-                    status="cancelled", limit=limite
-                )
-                titulo = "❌ CTAs canceladas"
-                subtitulo = "Actividades canceladas por oficiales"
-
-            else:  # all
+                result, status = await APIClient.get_ctas(status="cancelled", limit=limite)
+                titulo, subtitulo = "❌ CTAs canceladas", "Actividades canceladas"
+            else:
                 result, status = await APIClient.get_ctas(limit=limite)
-                titulo = "📜 Historial de CTAs"
-                subtitulo = "Todas las actividades registradas"
+                titulo, subtitulo = "📜 Historial de CTAs", "Todas las actividades"
 
-        except (AuthenticationError, AuthorizationError) as exc:
-            await interaction.followup.send(f"🔐 {exc}", ephemeral=True)
-            return
+            if status != 200 or not result.get("success"):
+                return await interaction.followup.send("❌ Error al consultar.", ephemeral=True)
 
-        if status != 200 or not result.get("success"):
-            await interaction.followup.send(
-                "❌ No se pudo consultar la lista de CTAs.", ephemeral=True
-            )
-            return
+            ctas = result.get("ctas", [])
+            if not ctas:
+                return await interaction.followup.send(f"📭 No hay CTAs en **{filtro_val}**.")
 
-        ctas = result.get("ctas", [])
-        if not ctas:
-            await interaction.followup.send(
-                f"📭 No hay CTAs en la categoría **{filtro_val}**."
-            )
-            return
+            embed = discord.Embed(title=titulo, description=f"*{subtitulo}* · {len(ctas)} resultado(s)", color=Config.EMBED_COLOR)
 
-        embed = discord.Embed(
-            title=titulo,
-            description=f"*{subtitulo}* · {len(ctas)} resultado(s)",
-            color=Config.EMBED_COLOR,
-        )
+            for cta in ctas[:15]:
+                start_iso = cta.get("start_time")
+                time_str = start_iso
+                try:
+                    start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                    time_str = f"<t:{int(start_dt.timestamp())}:R>"
+                except: pass
 
-        for cta in ctas[:15]:
-            start_iso = cta.get("start_time")
-            time_str = start_iso
-            try:
-                start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                ts = int(start_dt.timestamp())
-                time_str = f"<t:{ts}:R>"
-            except (ValueError, TypeError, AttributeError):
-                pass
+                badges = []
+                status_txt = cta.get("status", "?")
+                if status_txt == "scheduled": badges.append("🕐 programada")
+                elif status_txt == "cancelled": badges.append("❌ cancelada")
+                elif status_txt == "completed": badges.append("✅ completada")
+                if cta.get("paid"): badges.append("💵 pagada")
 
-            comp = (cta.get("composition") or {}).get("name", "—")
-            status_txt = cta.get("status", "?")
-            paid = cta.get("paid", False)
-            cta_id = cta.get("id", "?")
+                embed.add_field(
+                    name=f"#{cta.get('id')} · {cta.get('title', '—')[:70]}",
+                    value=f"📍 {cta.get('location', '—')}\n🎭 {(cta.get('composition') or {}).get('name', '—')} · 👥 {cta.get('confirmed_count', 0)}\n⏰ {time_str}\n{' · '.join(badges)}",
+                    inline=False,
+                )
 
-            badges = []
-            if status_txt == "scheduled":
-                badges.append("🕐 programada" if not paid else "💳 sin marcar")
-            elif status_txt == "cancelled":
-                badges.append("❌ cancelada")
-            elif status_txt == "completed":
-                badges.append("✅ completada")
-            if paid:
-                badges.append("💵 pagada")
-
-            badge_str = " · ".join(badges) if badges else ""
-
-            embed.add_field(
-                name=f"#{cta_id} · {cta.get('title', '—')[:70]}",
-                value=(
-                    f"📍 {cta.get('location', '—')}\n"
-                    f"🎭 {comp} · 👥 {cta.get('confirmed_count', 0)}\n"
-                    f"⏰ {time_str}\n"
-                    f"{badge_str}"
-                ),
-                inline=False,
-            )
-
-        if len(ctas) > 15:
-            embed.set_footer(text=f"… y {len(ctas) - 15} más · Filtro: {filtro_val}")
-        else:
             embed.set_footer(text=f"Filtro: {filtro_val}")
+            await interaction.followup.send(embed=embed)
 
-        await interaction.followup.send(embed=embed)
+        except Exception as exc:
+            logger.error("Error en /ctas: %s", exc)
 
     # ================================================================== #
-    #                          Error handler                              #
+    #                          Error handler                             #
     # ================================================================== #
 
-    async def cog_app_command_error(
-        self,
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ):
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         logger.error("Error en CtasCog: %s", error, exc_info=error)
         msg = "❌ Ocurrió un error inesperado. Intenta de nuevo."
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
+            if interaction.response.is_done(): await interaction.followup.send(msg, ephemeral=True)
+            else: await interaction.response.send_message(msg, ephemeral=True)
+        except Exception: pass
 
 
 async def setup(bot: commands.Bot):

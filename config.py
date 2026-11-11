@@ -79,6 +79,7 @@ class Config:
     #  CANAL DE ANUNCIOS DE CTAs
     # =================================================================
     CTA_ANNOUNCE_CHANNEL_ID = _int_env("CTA_ANNOUNCE_CHANNEL_ID")
+    CTA_CONTENT_CHANNEL_ID = _int_env("CTA_CONTENT_CHANNEL_ID")
 
     # =================================================================
     #  POLLER DE RECORDATORIOS (segundos entre ciclos)
