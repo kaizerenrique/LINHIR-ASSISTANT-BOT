@@ -80,6 +80,8 @@ class Config:
     # =================================================================
     CTA_ANNOUNCE_CHANNEL_ID = _int_env("CTA_ANNOUNCE_CHANNEL_ID")
     CTA_CONTENT_CHANNEL_ID = _int_env("CTA_CONTENT_CHANNEL_ID")
+    # En Config, junto a las otras variables:
+    VOICE_CATEGORY_ID = _int_env("VOICE_CATEGORY_ID")
 
     # =================================================================
     #  POLLER DE RECORDATORIOS (segundos entre ciclos)

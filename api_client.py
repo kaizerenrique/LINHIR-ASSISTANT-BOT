@@ -331,3 +331,13 @@ class APIClient:
     async def update_cta_announce(cls, cta_id: int, announce_at: str) -> tuple[dict, int]:
         payload = {"announce_at": announce_at}
         return await cls._request("POST", f"/ctas/{int(cta_id)}/announce", payload)
+    
+    @classmethod
+    async def get_ctas_with_voice(cls) -> tuple[dict, int]:
+        """GET /api/bot/ctas/voice-channels"""
+        return await cls._get("/ctas/voice-channels")
+
+    @classmethod
+    async def clear_voice_channel(cls, cta_id: int) -> tuple[dict, int]:
+        """POST /api/bot/ctas/{id}/clear-voice-channel"""
+        return await cls._request("POST", f"/ctas/{int(cta_id)}/clear-voice-channel")
