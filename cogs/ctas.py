@@ -881,14 +881,25 @@ class CtasCog(commands.Cog):
     async def _create_voice_channel(self, cta: dict):
         cta_id = cta["id"]
         vis = cta.get("visibility", "linhir")
-        guild = self.bot.guilds[0] if self.bot.guilds else None
-        if not guild: return
+        guild = self._pick_guild()
+        if not guild:
+            logger.error("_create_voice_channel: no se encontró el guild de Linhir")
+            return
+
+        # Categoría destino (si está configurada)
+        category = guild.get_channel(Config.VOICE_CATEGORY_ID) if Config.VOICE_CATEGORY_ID else None
+        if Config.VOICE_CATEGORY_ID and category is None:
+            logger.warning(
+                "VOICE_CATEGORY_ID=%s no encontrado en el guild. "
+                "El canal se creará en la raíz.",
+                Config.VOICE_CATEGORY_ID,
+            )
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(connect=False),
-            guild.me: discord.PermissionOverwrite(connect=True, manage_channels=True)
+            guild.me: discord.PermissionOverwrite(connect=True, manage_channels=True),
         }
-        
+
         role_id = Config.HRL_ROLE_ID if vis == "alliance" else Config.LINHIR_ROLE_ID
         role = guild.get_role(role_id)
         if role:
@@ -898,12 +909,23 @@ class CtasCog(commands.Cog):
             vc = await guild.create_voice_channel(
                 name=f"🔊 {cta.get('title', 'CTA')[:20]}",
                 overwrites=overwrites,
-                reason=f"Canal para CTA #{cta_id}"
+                category=category,                              # ← NUEVO
+                reason=f"Canal para CTA #{cta_id}",
             )
             await APIClient.update_voice_channel(cta_id, str(vc.id))
-            logger.info("Canal de voz %s creado para CTA #%s", vc.id, cta_id)
+            logger.info(
+                "Canal de voz %s creado para CTA #%s (categoría=%s)",
+                vc.id, cta_id, category.name if category else "raíz",
+            )
         except Exception as exc:
-            logger.error("Error creando canal de voz: %s", exc)
+            logger.error("Error creando canal de voz: %s", exc, exc_info=exc)
+
+    def _pick_guild(self) -> discord.Guild | None:
+        """Devuelve el guild de Linhir (por rol @Linhir o el único guild)."""
+        for guild in self.bot.guilds:
+            if guild.get_role(Config.LINHIR_ROLE_ID):
+                return guild
+        return self.bot.guilds[0] if self.bot.guilds else None
 
     # ================================================================== #
     #                 LISTENER: ENTRADA/SALIDA DE VOZ                    #
