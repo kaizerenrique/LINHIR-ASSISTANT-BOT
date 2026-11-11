@@ -380,9 +380,11 @@ class AnnouncementTimeView(discord.ui.View):
         
         # Calcular fecha de anuncio
         if minutes_before is None:
-            announce_at = datetime.now(timezone.utc).isoformat()
+            announce_at = datetime.now(timezone.utc)
         else:
-            announce_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes_before)).isoformat()
+            announce_at = start_dt - timedelta(minutes=minutes_before)
+            if announce_at < datetime.now(timezone.utc):
+                announce_at = datetime.now(timezone.utc)
 
         # Enviar a la API
         try:
