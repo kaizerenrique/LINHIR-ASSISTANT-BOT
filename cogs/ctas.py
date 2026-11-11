@@ -857,24 +857,90 @@ class CtasCog(commands.Cog):
         except Exception as exc:
             logger.exception("Error en voice_channel_loop: %s", exc)
 
+    def _flush_voice_sessions(self, cta_id: int):
+        """Descarta sesiones de voz huérfanas de una CTA."""
+        VOICE_SESSIONS.pop(cta_id, None)
+
     @tasks.loop(minutes=1)
     async def empty_channel_cleanup_loop(self):
-        """Borra canales de voz vacíos."""
+        """
+        Borra canales de voz de CTA en los siguientes casos:
+          - El canal está VACÍO (sin humanos).
+          - La CTA ya TERMINÓ (end_time < now).
+          - La CTA fue CANCELADA o COMPLETADA.
+        """
         try:
-            result, status = await APIClient.get_active_ctas()
-            if status != 200 or not result.get("success"): return
-            
+            result, status = await APIClient.get_ctas_with_voice()
+            if status != 200 or not result.get("success"):
+                return
+
+            now = datetime.now(timezone.utc)
+
             for cta in result.get("ctas", []):
-                vc_id = cta.get("discord_voice_channel_id")
-                if not vc_id: continue
-                
+                vc_id   = cta.get("discord_voice_channel_id")
+                cta_id  = cta.get("id")
+                if not vc_id:
+                    continue
+
+                # --- Motivos de borrado ---
+                reason_to_delete = None
+
+                # 1. Estado terminal
+                if cta.get("status") in ("cancelled", "completed"):
+                    reason_to_delete = f"CTA {cta['status']}"
+
+                # 2. Actividad terminada
+                else:
+                    end_iso = cta.get("end_time")
+                    if end_iso:
+                        try:
+                            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                            # Margen de 5 min después del end_time para no cortar
+                            # partidas que se alargan
+                            if now > end_dt + timedelta(minutes=5):
+                                reason_to_delete = "Actividad terminada"
+                        except (ValueError, TypeError):
+                            pass
+
+                # 3. Canal vacío
                 channel = self.bot.get_channel(int(vc_id))
-                if channel and len([m for m in channel.members if not m.bot]) == 0:
-                    try:
-                        await channel.delete(reason="Canal vacío")
-                        logger.info("Canal de voz %s eliminado", vc_id)
-                    except discord.HTTPException as exc:
-                        logger.warning("No se pudo borrar %s: %s", vc_id, exc)
+                if channel is None:
+                    # Canal borrado manualmente en Discord → limpiar en BD
+                    await APIClient.clear_voice_channel(cta_id)
+                    self._flush_voice_sessions(cta_id)
+                    logger.info(
+                        "Canal %s de CTA #%s no existe en Discord. ID limpiado.",
+                        vc_id, cta_id,
+                    )
+                    continue
+
+                if reason_to_delete is None:
+                    humans = [m for m in channel.members if not m.bot]
+                    if len(humans) == 0:
+                        reason_to_delete = "Canal vacío"
+
+                if reason_to_delete is None:
+                    continue
+
+                # --- Borrar ---
+                try:
+                    await channel.delete(reason=reason_to_delete)
+                    await APIClient.clear_voice_channel(cta_id)
+                    logger.info(
+                        "Canal de voz %s de CTA #%s eliminado (%s)",
+                        vc_id, cta_id, reason_to_delete,
+                    )
+                except discord.NotFound:
+                    # Ya no existe → limpiar en BD
+                    await APIClient.clear_voice_channel(cta_id)
+                except discord.HTTPException as exc:
+                    logger.warning(
+                        "No se pudo borrar el canal %s (CTA #%s): %s",
+                        vc_id, cta_id, exc,
+                    )
+
+                await asyncio.sleep(1)  # anti rate-limit
+
         except Exception as exc:
             logger.exception("Error en empty_channel_cleanup_loop: %s", exc)
 
@@ -975,7 +1041,7 @@ class CtasCog(commands.Cog):
 
     async def _get_cta_id_by_voice_channel(self, voice_channel_id: int) -> int | None:
         try:
-            result, status = await APIClient.get_active_ctas()
+            result, status = await APIClient.get_ctas_with_voice()
             if status == 200 and result.get("success"):
                 for cta in result["ctas"]:
                     if str(cta.get("discord_voice_channel_id")) == str(voice_channel_id):
